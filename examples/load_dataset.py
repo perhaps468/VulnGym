@@ -35,6 +35,12 @@ def demo_stdlib() -> None:
     entries = list(iter_jsonl(DATA / "entries.jsonl"))
     print(f"[stdlib] {len(reports)} reports / {len(entries)} entries")
 
+    # Human-audit subset (verify == 1).
+    verified = [e for e in entries if e.get("verify") == 1]
+    verified_reports = {e["report_id"] for e in verified}
+    print(f"[stdlib] human-audited: {len(verified)} entries / "
+          f"{len(verified_reports)} advisories (verify == 1)")
+
     # Join entries under their report_id.
     by_report: dict[str, list[dict]] = defaultdict(list)
     for e in entries:
@@ -47,7 +53,7 @@ def demo_stdlib() -> None:
     for e in by_report[biggest["report_id"]][:2]:
         ep, co = e["entry_point"], e["critical_operation"]
         print(f"  - {e['entry_id']}:  {ep['file']}:{ep['line']}  "
-              f"→  {co['file']}:{co['line']}")
+              f"→  {co['file']}:{co['line']}  verify={e.get('verify')}")
 
 
 # ---------------------------------------------------------------------------

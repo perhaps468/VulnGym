@@ -1,4 +1,4 @@
-# SCHEMA.md — VulnGym data format reference (v0.1.0)
+# SCHEMA.md — VulnGym data format reference (v0.1.1)
 
 The dataset ships two line-delimited JSON files under `data/`. Every line is
 a single self-contained JSON object (no trailing comma, `\n`-terminated,
@@ -30,6 +30,7 @@ Join key: `entries.report_id == reports.report_id`.
 | `entry_point` | `object` | ✅ | Reachable entry point — `{file, line, code}`. See below. |
 | `critical_operation` | `object` | ✅ | Critical operation (core defect location) — `{file, line, code}`. See below. |
 | `trace` | `object[]` | ✅ | Ordered taint-flow steps. Each item is `{file, line, code}`. May be empty. |
+| `verify` | `int` | ✅ | Human-audit flag. `1` = the entry has been reviewed and confirmed by a human annotator (high-confidence ground truth); `0` = automatically annotated, not yet human-confirmed. Added in v0.1.1. |
 
 ### `entry_point` / `critical_operation` / `trace[*]` object
 
@@ -66,7 +67,8 @@ Join key: `entries.report_id == reports.report_id`.
   },
   "trace": [
     {"file": "…", "line": 42, "code": "…"}
-  ]
+  ],
+  "verify": 1
 }
 ```
 
@@ -136,9 +138,10 @@ Every release must satisfy these before tagging:
    `{file, line, code}`; `line` is a non-negative integer.
 8. No row contains any of the internal fields we intentionally omit
    (`description`, `human_remark`, `pipeline_id`, `annotated_by`,
-   `human_confirmed`, `is_active`, `created_at`, `generality`,
+   `is_active`, `created_at`, `generality`,
    `detection_type`, `ground_truth`, `taint_source`, `taint_sink`,
    `vuln_category_l3`).
+9. Every `entry` row has a `verify` field whose value is exactly `0` or `1`.
 
 ---
 
@@ -146,6 +149,10 @@ Every release must satisfy these before tagging:
 
 - New **optional** top-level fields may be added in minor versions; existing
   fields will not be removed or re-typed without a major version bump.
+- `verify` was introduced in v0.1.1 as an integer flag (`0` / `1`); it may be
+  generalized to a richer status code (e.g. multiple audit levels) in a
+  future minor version while keeping backward-compatible truthy semantics
+  for `1`.
 - An English translation of `vuln_category_l1/l2` is a likely future
   addition as `vuln_category_l1_en` / `_l2_en`.
 - The JSONL ordering (entries by `entry_id` asc, reports by `report_id`

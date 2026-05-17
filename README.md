@@ -44,7 +44,8 @@
 ---
 
 ## 📢 What's New
-- **2026-05-xx** — 🎉 VulnGym v0.1.0 officially open-sourced!
+- **2026-05-17** — 🔧 v0.1.1 data refresh: added a `verify` field on every entry to mark human-audit status; **113 / 408 entries** (covering **61 / 184 advisories**) are now human-verified. Selected `entry_point` / `critical_operation` / `trace` values were also refined.
+- **2026-05-15** — 🎉 VulnGym v0.1.0 officially open-sourced!
 
 
 
@@ -77,7 +78,7 @@ evaluating the real-world vulnerability-hunting capabilities of AI agents:
 
 ## ✨ Dataset overview
 
-This is the **v0.1.0 open-source release** of VulnGym. Data is provided
+This is the **v0.1.1 release** of VulnGym. Data is provided
 as two JSONL files under the `data/` directory:
 
 - `reports.jsonl` — aggregated records at the GitHub Advisory granularity
@@ -94,6 +95,26 @@ full vulnerable source tree for the corresponding version.
 | Reachable entry points (entries) | **408** |
 | Distinct projects | 38 |
 | Distinct repositories | 23 |
+| Human-audited entries (`verify = 1`) | **113 / 408 (27.7 %)** |
+| Human-audited advisories (≥ 1 verified entry) | **61 / 184 (33.2 %)** |
+
+### Human audit status
+
+Starting in v0.1.1, every row in `entries.jsonl` carries a `verify` field
+(`int`, `0` or `1`):
+
+- `verify == 1` — the entry's `entry_point`, `critical_operation`, and
+  `trace` have been reviewed and confirmed by a human annotator. These
+  rows form a high-confidence ground-truth subset and are recommended
+  for strict, reproducible benchmarking.
+- `verify == 0` — automatically annotated; not yet human-confirmed.
+  Useful for scale and recall studies, but values may still be refined
+  in future releases.
+
+Of the **184** advisories, **50** have all of their entries verified and
+**11** are partially verified, for a total of **61** advisories with at
+least one human-audited entry. Future releases will continue to expand
+the verified subset.
 
 ### Vulnerability type distribution
 
@@ -179,7 +200,7 @@ VulnGym/
 ├── LICENSE                      # CC-BY-4.0
 ├── data/
 │   ├── reports.jsonl            # 184 rows — one GitHub Advisory per row
-│   └── entries.jsonl            # 408 rows — one entry point per row
+│   └── entries.jsonl            # 408 rows — one entry point per row, with human-audit flag (verify)
 └── examples/
     ├── load_dataset.py          # stdlib / pandas / HuggingFace datasets loader
     ├── example_result.jsonl     # illustrative tool-findings submission
@@ -206,6 +227,10 @@ with open("data/entries.jsonl", encoding="utf-8") as f:
 xss = [e for e in entries if e["vuln_category_l1"] == "XSS"]
 print(len(xss), "XSS entries")
 print(xss[0]["entry_point"], "→", xss[0]["critical_operation"])
+
+# Restrict to the human-audited high-confidence subset
+verified = [e for e in entries if e["verify"] == 1]
+print(len(verified), "human-audited entries")
 ```
 
 Pandas:
@@ -266,8 +291,30 @@ All policies are documented and configurable via CLI arguments
 
 ## 📖 Citation
 
+> 📚 **A companion paper is in preparation.** Until it is released, please cite VulnGym using the dataset entry below; we will update this section once the paper is publicly available.
+
 ```bibtex
-TODO: A paper or dataset DOI will be assigned for proper citation tracking.
+@misc{vulngym2026,
+  title        = {VulnGym: A Real-World, Project-Level Vulnerability Benchmark
+                  for White-Box Vulnerability-Hunting Agents},
+  author       = {{Tencent Wukong Code Security Team and contributors}},
+  year         = {2026},
+  version      = {0.1.1},
+  howpublished = {\url{https://github.com/Tencent/VulnGym}},
+  note         = {Dataset. A companion paper is in preparation; please check
+                  the repository for the latest citation.}
+}
+```
+
+Once the paper is public, the entry below will be filled in and should be preferred:
+
+```bibtex
+@inproceedings{vulngym2026paper,
+  title     = {TBA — A companion paper for VulnGym is in preparation.},
+  author    = {{To be announced}},
+  year      = {TBA},
+  note      = {Placeholder; will be replaced once the paper is publicly available.}
+}
 ```
 
 See `CITATION.cff` for the machine-readable form.
@@ -299,14 +346,13 @@ listed there are enforced at release time.
 
 ## 🙏 Acknowledgements
 
-VulnGym is jointly built by the **Tencent Wukong Code Security Team
-(Tencent Security Platform Department)** together with the following
-academic partners (listed in no particular order):
+VulnGym is jointly built by the **Tencent Wukong Security Team**
+together with the following academic partners (listed in no particular
+order, final order TBD):
 
 - Systems Software & Security Lab, Fudan University
+- JC STEM Lab of Intelligent Cybersecurity, The University of Hong Kong
 - Prof. Li Hui's Team, Peking University Shenzhen Graduate School
-- The University of Hong Kong (TBD)
-- Harbin Institute of Technology (TBD)
 - Network Threat Analysis Lab, Institute of Information Engineering, Chinese Academy of Sciences
 
 Many thanks to all partners for their outstanding contributions to

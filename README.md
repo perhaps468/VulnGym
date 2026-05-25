@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./img/wukong_logo.png" alt="VulnGym" height="100">
+  <img src="./img/wukong_logo.png" alt="VulnGym" height="60">
 </p>
 
 <h4 align="center">

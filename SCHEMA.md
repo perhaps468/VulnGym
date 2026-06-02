@@ -37,8 +37,18 @@ Join key: `entries.report_id == reports.report_id`.
 | field | type | description |
 |---|---|---|
 | `file` | `string` | Repository-relative path at the vulnerable commit. |
-| `line` | `int` | 1-based line number (always integer — upstream string values are coerced). `0` means unknown. |
+| `line` | `int` \| `string` | Line location, **1-based**. Either a single positive integer (e.g. `97`) or a range string `"start-end"` where `start` and `end` are integers with `1 ≤ start ≤ end` (e.g. `"348-352"`). Always `≥ 1` — the value `0` is **not** permitted. Single-line upstream string values are coerced to `int`; range values stay strings. |
 | `code` | `string` | Verbatim code snippet. May span multiple lines via `\n` and may contain 中文 inline comments when the annotator added them. |
+
+`line` has two valid forms:
+
+- **single line** — an `int` `≥ 1`, e.g. `"line": 97`.
+- **line range** — a `string` `"start-end"` with `1 ≤ start ≤ end`, e.g.
+  `"line": "348-352"` (a single-line span may also be written this way, e.g.
+  `"line": "97-97"`).
+
+A consumer can normalize either form to a `(start, end)` pair: an `int` `n`
+maps to `(n, n)`; a string `"a-b"` splits on `-` to `(int(a), int(b))`.
 
 ### Example
 
@@ -66,7 +76,7 @@ Join key: `entries.report_id == reports.report_id`.
     "code": "tempDiv.innerHTML = htmlContent;"
   },
   "trace": [
-    {"file": "…", "line": 42, "code": "…"}
+    {"file": "…", "line": "42-45", "code": "…"}
   ],
   "verify": 1
 }
@@ -135,7 +145,9 @@ Every release must satisfy these before tagging:
 6. `source_link` contains `github.com/advisories/` and its embedded GHSA id
    equals `report_id`.
 7. `entry_point`, `critical_operation`, and every `trace[i]` have exactly the keys
-   `{file, line, code}`; `line` is a non-negative integer.
+   `{file, line, code}`. `line` is either a **positive integer** (`≥ 1`) or a
+   **range string** `"a-b"` where `a` and `b` are integers with `1 ≤ a ≤ b`.
+   The value `0` is **not** permitted.
 8. No row contains any of the internal fields we intentionally omit
    (`description`, `human_remark`, `pipeline_id`, `annotated_by`,
    `is_active`, `created_at`, `generality`,
@@ -153,6 +165,11 @@ Every release must satisfy these before tagging:
   generalized to a richer status code (e.g. multiple audit levels) in a
   future minor version while keeping backward-compatible truthy semantics
   for `1`.
+- `line` (in `entry_point` / `critical_operation` / `trace[*]`) was widened
+  from a plain non-negative `int` to `int | "start-end"` (positive
+  integer **or** range string), and the `0`-means-unknown sentinel was
+  retired — `line` is now always `≥ 1`. Consumers should accept both the `int`
+  and the range-string form.
 - An English translation of `vuln_category_l1/l2` is a likely future
   addition as `vuln_category_l1_en` / `_l2_en`.
 - The JSONL ordering (entries by `entry_id` asc, reports by `report_id`

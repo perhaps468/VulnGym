@@ -142,6 +142,16 @@ EP_DESC = (
     "在缺少 USER 指令覆盖默认身份的配置类漏洞中，FROM 即 entry_point。"
 )
 
+EP_DESC_OVERRIDE: dict[str, str] = {
+    "entry-00244": (
+        "以 {base_image} 为构建起点的基础镜像声明。该镜像内建默认活跃用户为 root（uid=0），"
+        "FROM 指令由此把 root 上下文引入镜像，是整条特权传播链的源头；"
+        "本条 Dockerfile 在第 18 行写入了 NOPASSWD:ALL sudoers 配置，使紧随其后的 USER app 形式降权"
+        "被无成本提权通道消解，整条特权传播链因此在 USER 切换后仍然保持完整 root 能力，"
+        "故此处仍取 FROM 作为 entry_point 以标定不安全默认的引入点。"
+    ),
+}
+
 # ---------- per-entry payloads -----------------------------------------
 
 ENTRIES: list[dict] = [
@@ -250,7 +260,9 @@ def build_row(entry: dict) -> dict:
             "file": entry["file"],
             "line": 1,
             "code": f"FROM {entry['from_image']}",
-            "desc": EP_DESC.format(base_image=entry["from_image"]),
+            "desc": (EP_DESC_OVERRIDE.get(entry["entry_id"]) or EP_DESC).format(
+                base_image=entry["from_image"]
+            ),
         },
         "critical_operation": {
             "file": entry["file"],
@@ -322,7 +334,7 @@ def apply_fix(entries: list[dict]) -> tuple[list[dict], list[dict]]:
 def write_entries(entries: list[dict]) -> None:
     with JSONL_OUT.open("w", encoding="utf-8", newline="\n") as f:
         for row in entries:
-            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n")
 
 
 def write_csv(originals: list[dict]) -> None:
@@ -345,7 +357,9 @@ def write_csv(originals: list[dict]) -> None:
             "file": fixed["file"],
             "line": 1,
             "code": f"FROM {fixed['from_image']}",
-            "desc": EP_DESC.format(base_image=fixed["from_image"]),
+            "desc": (EP_DESC_OVERRIDE.get(fixed["entry_id"]) or EP_DESC).format(
+                base_image=fixed["from_image"]
+            ),
         }
         fixed_critical_operation = {
             "file": fixed["file"],

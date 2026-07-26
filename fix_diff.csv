@@ -12,5 +12,5 @@ entry-00320,entry_point,(replaced),src/backend/base/langflow/api/v2/files.py::12
 entry-00320,critical_operation,(replaced),src/backend/base/langflow/services/storage/local.py::116,1
 entry-00320,trace,(replaced),[5 trace node(s)],1
 entry-00391,entry_point,(replaced),src/fastmcp/utilities/openapi/director.py::23-28,1
-entry-00391,critical_operation,(replaced),src/fastmcp/utilities/openapi/director.py::194-216,1
+entry-00391,critical_operation,(replaced),src/fastmcp/utilities/openapi/director.py::213,1
 entry-00391,trace,(replaced),[5 trace node(s)],1

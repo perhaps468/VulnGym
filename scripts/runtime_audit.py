@@ -450,14 +450,16 @@ def main(argv: list[str]) -> int:
 
     found: dict[str, dict] = {}
     with ENTRIES_PATH.open("r", encoding="utf-8") as src:
-        for raw in src:
+        for line_no, raw in enumerate(src, start=1):
             line = raw.strip()
             if not line:
-                continue
+                print(f"{ENTRIES_PATH}: blank JSONL row at line {line_no}", file=sys.stderr)
+                return 1
             try:
                 obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                print(f"{ENTRIES_PATH}: invalid JSON at line {line_no}: {exc}", file=sys.stderr)
+                return 1
             if obj.get("entry_id") in TARGETED:
                 found[obj["entry_id"]] = obj
 
@@ -474,6 +476,7 @@ def main(argv: list[str]) -> int:
                 message=f"missing target {eid}",
                 data={"entry_id": eid},
             )
+            overall_failures += 1
             continue
 
         run_id = "initial"

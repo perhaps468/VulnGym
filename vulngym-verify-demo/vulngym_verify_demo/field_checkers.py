@@ -299,7 +299,19 @@ def check_vuln_title(
         data.setdefault("status", "uncertain")
         data.setdefault("confidence", 0.50)
         data.setdefault("evidence", "LLM 语义判断")
-        data.setdefault("evidence_refs", refs)
+        # I4 修复：setdefault 在 mock 已有空列表时不会覆盖，改为 append-merge
+        existing = data.get("evidence_refs") or []
+        if not isinstance(existing, list):
+            existing = []
+        # 去重（按 source+locator+quote 三键）
+        seen = {(r.get("source"), r.get("locator"), r.get("quote"))
+                for r in existing if isinstance(r, dict)}
+        for r in refs:
+            key = (r.get("source"), r.get("locator"), r.get("quote"))
+            if key not in seen:
+                existing.append(r)
+                seen.add(key)
+        data["evidence_refs"] = existing
         return data
     except Exception:
         # 回退：简单包含
@@ -338,6 +350,17 @@ def check_category(
         data.setdefault("confidence", 0.50)
         data.setdefault("evidence", "LLM 语义判断")
         data.setdefault("evidence_refs", refs)
+        # I4 兼容：append-merge 模式（若 LLM 返回已有 evidence_refs，refs 也追加）
+        existing = data.get("evidence_refs") or []
+        if isinstance(existing, list) and refs:
+            seen = {(r.get("source"), r.get("locator"), r.get("quote"))
+                    for r in existing if isinstance(r, dict)}
+            for r in refs:
+                key = (r.get("source"), r.get("locator"), r.get("quote"))
+                if key not in seen:
+                    existing.append(r)
+                    seen.add(key)
+            data["evidence_refs"] = existing
         return data
     except Exception:
         return {"status": "uncertain", "confidence": 0.40,
@@ -401,6 +424,17 @@ def check_trace(
         data.setdefault("confidence", 0.50)
         data.setdefault("evidence", "LLM 语义判断")
         data.setdefault("evidence_refs", refs)
+        # I4 兼容：append-merge 模式
+        existing = data.get("evidence_refs") or []
+        if isinstance(existing, list) and refs:
+            seen = {(r.get("source"), r.get("locator"), r.get("quote"))
+                    for r in existing if isinstance(r, dict)}
+            for r in refs:
+                key = (r.get("source"), r.get("locator"), r.get("quote"))
+                if key not in seen:
+                    existing.append(r)
+                    seen.add(key)
+            data["evidence_refs"] = existing
         return data
     except Exception:
         return {"status": "uncertain", "confidence": 0.50,

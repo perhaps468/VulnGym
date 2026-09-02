@@ -14,11 +14,131 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from .prompts import (
+    PROMPT_VERSIONS,
+    SELF_CHECK_PROMPT,
+    TRACE_OVERALL_PROMPT,
+    VULN_IDS_PROMPT,
+    VULN_TITLE_PROMPT,
+    get_prompt_version,
+    vuln_category_prompt,
+)
+
 
 @dataclass
 class LLMMessage:
     role: str
     content: str
+
+
+# ============================================================
+# I4 新增：脱敏 + 结构化响应解析
+# ============================================================
+
+# 脱敏正则（参考 schema._sanitize_message，提到模块顶层）
+_REDACT_RX = [
+    (re.compile(r"[A-Za-z]:\\[^\s\"']+"), "<abspath>"),   # Windows 反斜杠
+    (re.compile(r"[A-Za-z]:/[^\s\"']+"), "<abspath>"),    # Windows 正斜杠
+    (re.compile(r"/(?:home|Users|var|tmp|opt|root)/[^\s\"']+"), "<abspath>"),  # POSIX
+    # 32+ 字符的 hex/base64（词边界触发，避免误删短 hex 如 commit 8 位前缀）
+    (re.compile(r"\b[A-Za-z0-9_/+=]{32,}\b"), "<redacted>"),
+    # API key 常见前缀
+    (re.compile(r"\b(?:sk-|Bearer\s+)[A-Za-z0-9_\-+/=]{8,}"), "<redacted>"),
+]
+
+
+def redact_text(text: str) -> str:
+    """脱敏：移除绝对路径与 API key 风格字符串。
+
+    不抛异常——任何输入都返回字符串。
+    """
+    if not text:
+        return ""
+    for rx, repl in _REDACT_RX:
+        text = rx.sub(repl, text)
+    return text
+
+
+# 合法的 status 取值
+_VALID_STATUS = {"correct", "incorrect", "uncertain"}
+
+
+def parse_structured_response(raw: Any) -> Dict[str, Any]:
+    """解析 LLM 原始输出（字符串）→ 统一 4 键结构。
+
+    规则（I4 启动手册 §3.1）：
+      - 合法 JSON → 校验 4 键；缺 evidence_refs 补 []；status 非法 → uncertain
+      - 非法 JSON → uncertain + 默认 evidence
+      - evidence 空 → 补默认文本（同时 status 降级为 uncertain 防编造证据）
+      - confidence 限制到 [0, 1]
+      - 所有 evidence 字段走 redact_text
+
+    入参也可以是 dict（已 parse 过），便于单测与内部调用复用。
+    """
+    UNCERTAIN_FALLBACK = {
+        "status": "uncertain",
+        "confidence": 0.20,
+        "evidence": "LLM output unparseable; cannot perform semantic judgement.",
+        "evidence_refs": [],
+    }
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return UNCERTAIN_FALLBACK
+
+    if not isinstance(data, dict):
+        return UNCERTAIN_FALLBACK
+
+    # status
+    status = data.get("status", "uncertain")
+    if status not in _VALID_STATUS:
+        status = "uncertain"
+
+    # confidence
+    try:
+        conf = float(data.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    # evidence
+    evidence_raw = data.get("evidence", "") or ""
+    if not isinstance(evidence_raw, str):
+        evidence_raw = str(evidence_raw)
+    evidence = redact_text(evidence_raw)
+    if not evidence.strip():
+        evidence = "LLM gave empty evidence; treating as uncertain."
+        # 空 evidence 时 status 降级为 uncertain（防编造证据）
+        if status == "correct":
+            status = "uncertain"
+
+    # evidence_refs（缺则补 []）
+    refs = data.get("evidence_refs", [])
+    if not isinstance(refs, list):
+        refs = []
+    # 每个 ref 走脱敏
+    clean_refs = []
+    for r in refs:
+        if not isinstance(r, dict):
+            continue
+        s = r.get("source", "")
+        if s not in {"advisory", "repository", "git"}:
+            continue
+        clean_refs.append({
+            "source": s,
+            "locator": redact_text(str(r.get("locator", ""))),
+            "quote": redact_text(str(r.get("quote", ""))),
+        })
+
+    return {
+        "status": status,
+        "confidence": conf,
+        "evidence": evidence,
+        "evidence_refs": clean_refs,
+    }
 
 
 class LLMError(RuntimeError):
@@ -209,7 +329,15 @@ class ScriptedMockLLMClient(BaseLLMClient):
     @staticmethod
     def _json(status: str, confidence: float, evidence: str) -> str:
         return json.dumps(
-            {"status": status, "confidence": confidence, "evidence": evidence},
+            {"status": status, "confidence": confidence, "evidence": evidence,
+             "evidence_refs": []},
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _self_check(agree: bool, comment: str) -> str:
+        return json.dumps(
+            {"agree": agree, "comment": comment},
             ensure_ascii=False,
         )
 
@@ -217,14 +345,16 @@ class ScriptedMockLLMClient(BaseLLMClient):
         prompt = "\n".join(m.content for m in messages)
 
         # ---- self-check（必须放最前：fields dump 里包含 "vuln_category_l1" 等，会被后续分支误匹配）----
-        if "请复核" in prompt or "self-check" in prompt.lower():
-            return json.dumps(
-                {"agree": True, "comment": "各字段证据一致，未发现冲突（mock 自检）"},
-                ensure_ascii=False,
+        if "请复核" in prompt or "self-check" in prompt.lower() or \
+           "self_check_judge" in prompt:
+            return self._self_check(
+                True,
+                "各字段证据一致，未发现冲突（mock 自检）",
             )
 
         # ---- category ----
-        if "vuln_category_l1" in prompt or "vuln_category_l2" in prompt:
+        if "vuln_category_l1" in prompt or "vuln_category_l2" in prompt or \
+           "vuln_category_l1_judge" in prompt or "vuln_category_l2_judge" in prompt:
             m = re.search(r"vuln_category_l[12].*?expected\s*[:：]\s*\"?([^\"\n]+)", prompt)
             if not m:
                 m = re.search(r"advisory_hint_l[12].*?[:：]\s*\"?([^\"\n]+)", prompt)
@@ -236,15 +366,16 @@ class ScriptedMockLLMClient(BaseLLMClient):
             return self._json("incorrect", 0.80, f"实际值 {actual_val} 与公告提示 {expected} 不一致")
 
         # ---- title ----
-        if "vuln_title" in prompt:
+        if "vuln_title" in prompt or "vuln_title_judge" in prompt:
             return self._json("correct", 0.75, "标题与公告核心语义一致（mock 判定）")
 
         # ---- vuln_ids ----
-        if "vuln_ids" in prompt:
+        if "vuln_ids" in prompt or "vuln_ids_judge" in prompt:
             return self._json("correct", 0.90, "CVE / GHSA 编号在公告缓存中找到（mock 判定）")
 
         # ---- trace summary ----
-        if "trace 链路整体合理性" in prompt or "trace_overall" in prompt:
+        if "trace 链路整体合理性" in prompt or "trace_overall_judge" in prompt or \
+           "trace_overall" in prompt:
             return self._json("correct", 0.70, "trace 链路上下游语义连贯（mock 判定）")
 
         # ---- default ----
@@ -274,12 +405,14 @@ class SafeLLMClient(BaseLLMClient):
             "LLM unavailable; cannot perform semantic judgement. "
             "needs: re-run with API key set, or supply a manual audit."
         ),
+        "evidence_refs": [],
     }
 
     def chat(self, messages: List[LLMMessage], *, temperature: float = 0.0) -> str:
         prompt = "\n".join(m.content for m in messages)
         # self-check 走同样协议：保持结构对齐。
-        if "请复核" in prompt or "self-check" in prompt.lower():
+        if "请复核" in prompt or "self-check" in prompt.lower() or \
+           "self_check_judge" in prompt:
             return json.dumps(
                 {
                     "agree": False,

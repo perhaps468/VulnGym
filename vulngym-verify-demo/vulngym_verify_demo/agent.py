@@ -424,6 +424,20 @@ def _fallback_error_report(
     }
 
 
+def _make_empty_fields(evidence: str) -> Dict[str, Dict[str, Any]]:
+    """生成 8 个空字段，全部 uncertain。"""
+    # 复用 EIGHT_FIELDS 常量，避免硬编码重复
+    return {
+        name: {
+            "status": "uncertain",
+            "confidence": 0.0,
+            "evidence": evidence,
+            "evidence_refs": []
+        }
+        for name in EIGHT_FIELDS
+    }
+
+
 def verify_entries(
     entries: List[Dict[str, Any]],
     tools: VulnGymTools,
@@ -435,9 +449,64 @@ def verify_entries(
     - 顺序处理（I5 不并发）
     - 任何一条失败不中断后续
     - verbose=True 时打印进度与判定摘要
+    - I6：坏 JSON / 缺字段生成 __invalid_input__ 报告
     """
     reports: List[Dict[str, Any]] = []
     for i, entry in enumerate(entries):
+        # ---- I6: 检测解析错误 ----
+        if entry.get("__parse_error__"):
+            line_no = entry.get("__line_no__", i)
+            report = {
+                "report_id": f"__invalid_input__:{line_no}",
+                "entry_id": f"__invalid_input__:{line_no}",
+                "verdict": "uncertain",
+                "input_error": {
+                    "line_no": line_no,
+                    "kind": "json_parse_error",
+                    "message": entry.get("__error_message__", "unknown")
+                },
+                "fields": _make_empty_fields("输入行解析失败"),
+                "summary": f"输入行 {line_no} JSON 解析失败",
+                "self_check": {"status": "skipped", "agree": False, "comment": "输入无效", "checked_fields": []},
+                "plan": {},
+                "tool_trace": []
+            }
+            reports.append(report)
+            if verbose:
+                print(f"  [skip] line {line_no}: parse error")
+            continue
+        
+        # ---- I6: 检测缺字段 ----
+        # 使用完整的 14 个必填字段（与 schema.py ENTRY_REQUIRED_FIELDS 对齐）
+        required = [
+            "entry_id", "report_id", "source_link", "vuln_ids", "origin",
+            "project", "repo_url", "commit", "vuln_title", "vuln_category_l1",
+            "vuln_category_l2", "entry_point", "critical_operation", "trace"
+        ]
+        missing = [k for k in required if k not in entry]
+        if missing:
+            entry_id = entry.get("entry_id", f"__invalid_input__:{i+1}")
+            report = {
+                "report_id": entry.get("report_id", f"__invalid_input__:{i+1}"),
+                "entry_id": entry_id,
+                "verdict": "uncertain",
+                "input_error": {
+                    "line_no": i + 1,
+                    "kind": "missing_required_field",
+                    "message": f"缺少必填字段: {missing}"
+                },
+                "fields": _make_empty_fields(f"缺少必填字段: {missing}"),
+                "summary": f"缺少必填字段: {', '.join(missing)}",
+                "self_check": {"status": "skipped", "agree": False, "comment": "输入不完整", "checked_fields": []},
+                "plan": {},
+                "tool_trace": []
+            }
+            reports.append(report)
+            if verbose:
+                print(f"  [skip] {entry_id}: missing fields {missing}")
+            continue
+        
+        # ---- 原有正常处理逻辑 ----
         if verbose:
             print(f"\n=== entry {i + 1}/{len(entries)}: {entry.get('entry_id')} / {entry.get('report_id')} ===")
         try:

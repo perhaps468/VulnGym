@@ -426,8 +426,7 @@ def _fallback_error_report(
 
 def _make_empty_fields(evidence: str) -> Dict[str, Dict[str, Any]]:
     """生成 8 个空字段，全部 uncertain。"""
-    field_names = ["entry_point", "critical_operation", "commit", "vuln_ids", 
-                   "vuln_title", "vuln_category_l1", "vuln_category_l2", "trace"]
+    # 复用 EIGHT_FIELDS 常量，避免硬编码重复
     return {
         name: {
             "status": "uncertain",
@@ -435,7 +434,7 @@ def _make_empty_fields(evidence: str) -> Dict[str, Dict[str, Any]]:
             "evidence": evidence,
             "evidence_refs": []
         }
-        for name in field_names
+        for name in EIGHT_FIELDS
     }
 
 
@@ -478,7 +477,12 @@ def verify_entries(
             continue
         
         # ---- I6: 检测缺字段 ----
-        required = ["report_id", "commit", "entry_point", "critical_operation"]
+        # 使用完整的 14 个必填字段（与 schema.py ENTRY_REQUIRED_FIELDS 对齐）
+        required = [
+            "entry_id", "report_id", "source_link", "vuln_ids", "origin",
+            "project", "repo_url", "commit", "vuln_title", "vuln_category_l1",
+            "vuln_category_l2", "entry_point", "critical_operation", "trace"
+        ]
         missing = [k for k in required if k not in entry]
         if missing:
             entry_id = entry.get("entry_id", f"__invalid_input__:{i+1}")

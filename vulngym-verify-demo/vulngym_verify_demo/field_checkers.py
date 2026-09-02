@@ -7,11 +7,18 @@ vuln_title / vuln_category_l1 / vuln_category_l2 / trace。
       "status":     "correct" | "incorrect" | "uncertain",
       "confidence": float in [0, 1],
       "evidence":   一句话以上，引用工具返回的具体内容
+      "evidence_refs": List[Dict[str, str]]   # I3 新增 — I1 schema 已冻结字段
     }
 
 策略：
 - 优先用工具做确定性检查（grep_code / read_file_lines）
 - 信息不足或需要语义理解时调用 LLM（带 mock fallback）
+
+I3 升级：
+  * 每个 check_field_X 填充 evidence_refs:
+    - 确定性字段（entry_point / critical_operation / commit / trace）：repository / git
+    - 公告相关字段（vuln_ids / title / category_l1 / l2）：advisory
+  * check_all_fields 汇总逻辑**不改**（ISSUE_OUTLINE §5 I3 明确约束）
 """
 from __future__ import annotations
 
@@ -22,6 +29,50 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .llm_client import BaseLLMClient, LLMMessage
 from .tools import ToolResult, VulnGymTools, normalize_project_from_repo
+# 避免循环导入：models.py 末尾会 import field_checkers，所以这里不能用
+# `from .models import EvidenceRef`。直接用具名字典构造（schema.py §4.1
+# 与 validate_evidence_ref 完全兼容），并在 to_dict 输出时保持同构。
+
+
+# ============================================================
+# EvidenceRef 工厂函数（I3 新增）
+# ============================================================
+
+
+def _ref_repo(file: str, commit: str, line_spec: Any, quote: str) -> Dict[str, str]:
+    """构造 repository 类型引用 dict（与 EvidenceRef.to_dict() 同构）。
+
+    locator 格式: <commit[:7]>:<file>:<line>
+    quote 截断到 80 字符（schema.py §4.1 限制）
+    """
+    locator = "{}:{}:{}".format(commit[:7], file, line_spec)
+    q = (quote or "").strip()
+    if len(q) > 80:
+        q = q[:80]
+    return {"source": "repository", "locator": locator, "quote": q}
+
+
+def _ref_git(project: str, commit: str, sha_or_message: str, quote: str = "") -> Dict[str, str]:
+    """构造 git 类型引用 dict。
+
+    locator 格式: <project>/<commit[:7]>:<sha_or_message>
+    """
+    locator = "{}/{}:{}".format(project, commit[:7], sha_or_message)
+    q = (quote or "").strip()
+    if len(q) > 80:
+        q = q[:80]
+    return {"source": "git", "locator": locator, "quote": q}
+
+
+def _ref_advisory(advisory_locator: str, quote: str) -> Dict[str, str]:
+    """构造 advisory 类型引用 dict。
+
+    locator 格式: advisory.json#<json_path>
+    """
+    q = (quote or "").strip()
+    if len(q) > 80:
+        q = q[:80]
+    return {"source": "advisory", "locator": advisory_locator, "quote": q}
 
 
 # ---------- 辅助：line 归一化 ----------
@@ -33,6 +84,13 @@ def _line_range(value: Any) -> Tuple[int, int]:
         a, b = value.split("-", 1)
         return (int(a), int(b))
     raise ValueError(f"bad line spec: {value!r}")
+
+
+def _line_spec_repr(value: Any) -> str:
+    """把 line spec 序列化成 locator 用字符串。"""
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
 
 
 def _norm_code(code: str) -> str:
@@ -59,22 +117,29 @@ def check_entry_point(
     co = tools.checkout(project, commit)
     if not co.ok:
         return {"status": "incorrect", "confidence": 0.95,
-                "evidence": f"无法 checkout 到 commit={commit[:7]}：{co.error}"}
+                "evidence": f"无法 checkout 到 commit={commit[:7]}：{co.error}",
+                "evidence_refs": []}
 
     reads = tools.read_file_lines(co.data["cwd"], ep["file"],
                                   *_line_range(ep["line"]))
     if not reads.ok:
         # 文件根本不存在 -> 明确 incorrect（典型数据脏）
         return {"status": "incorrect", "confidence": 0.95,
-                "evidence": f"文件不存在：{ep['file']}（{reads.error}）"}
+                "evidence": f"文件不存在：{ep['file']}（{reads.error}）",
+                "evidence_refs": [_ref_repo(ep["file"], commit, ep["line"],
+                                            f"file not found: {ep['file']}")]}
 
     snippet = reads.data["snippet"]
     actual = _norm_code(snippet)
     expected = _norm_code(ep["code"])
-    # 允许“标注代码是实测代码的子串”或反过来，兼容多行截取差异。
+    refs: List[Dict[str, str]] = [
+        _ref_repo(ep["file"], commit, ep["line"], snippet),
+    ]
+    # 允许"标注代码是实测代码的子串"或反过来，兼容多行截取差异。
     if expected in actual or actual in expected:
         return {"status": "correct", "confidence": 0.90,
-                "evidence": f"checkout 后 {ep['file']}:{ep['line']} 代码片段匹配 (snippet={snippet.strip()[:120]})"}
+                "evidence": f"checkout 后 {ep['file']}:{ep['line']} 代码片段匹配 (snippet={snippet.strip()[:120]})",
+                "evidence_refs": refs}
 
     # 第二层：行号可能因为 commit 漂移或标注误差发生偏移，尝试局部窗口复核。
     s, e = _line_range(ep["line"])
@@ -82,10 +147,16 @@ def check_entry_point(
     near = tools.read_file_lines(co.data["cwd"], ep["file"], near_start, near_end)
     if near.ok and expected in _norm_code(near.data["snippet"]):
         return {"status": "uncertain", "confidence": 0.55,
-                "evidence": f"行号偏移：在 {near_start}-{near_end} 范围内找到匹配代码片段，但原 line {ep['line']} 不匹配"}
+                "evidence": f"行号偏移：在 {near_start}-{near_end} 范围内找到匹配代码片段，但原 line {ep['line']} 不匹配",
+                "evidence_refs": refs + [
+                    _ref_repo(ep["file"], commit,
+                              f"{near_start}-{near_end}",
+                              near.data["snippet"]),
+                ]}
 
     return {"status": "incorrect", "confidence": 0.85,
-            "evidence": f"代码片段不匹配：actual={actual[:80]} expected={expected[:80]}"}
+            "evidence": f"代码片段不匹配：actual={actual[:80]} expected={expected[:80]}",
+            "evidence_refs": refs}
 
 
 def check_critical_operation(
@@ -99,50 +170,77 @@ def check_critical_operation(
     co = tools.checkout(project, commit)
     if not co.ok:
         return {"status": "incorrect", "confidence": 0.95,
-                "evidence": f"无法 checkout：{co.error}"}
+                "evidence": f"无法 checkout：{co.error}",
+                "evidence_refs": []}
 
     reads = tools.read_file_lines(co.data["cwd"], co_field["file"],
                                   *_line_range(co_field["line"]))
     if not reads.ok:
         return {"status": "incorrect", "confidence": 0.95,
-                "evidence": f"critical_operation 文件不存在：{co_field['file']}"}
+                "evidence": f"critical_operation 文件不存在：{co_field['file']}",
+                "evidence_refs": [_ref_repo(co_field["file"], commit, co_field["line"],
+                                            f"file not found: {co_field['file']}")]}
 
     actual = _norm_code(reads.data["snippet"])
     expected = _norm_code(co_field["code"])
+    refs: List[Dict[str, str]] = [
+        _ref_repo(co_field["file"], commit, co_field["line"], reads.data["snippet"]),
+    ]
     if expected in actual or actual in expected:
         return {"status": "correct", "confidence": 0.90,
-                "evidence": f"checkout 后 {co_field['file']}:{co_field['line']} 匹配 (snippet={reads.data['snippet'].strip()[:120]})"}
+                "evidence": f"checkout 后 {co_field['file']}:{co_field['line']} 匹配 (snippet={reads.data['snippet'].strip()[:120]})",
+                "evidence_refs": refs}
 
     # 临近窗口搜索
     s, e = _line_range(co_field["line"])
     near = tools.read_file_lines(co.data["cwd"], co_field["file"], max(1, s - 5), e + 5)
     if near.ok and expected in _norm_code(near.data["snippet"]):
         return {"status": "uncertain", "confidence": 0.55,
-                "evidence": f"行号漂移：邻近 ±5 行内能匹配，但 line {co_field['line']} 不匹配"}
+                "evidence": f"行号漂移：邻近 ±5 行内能匹配，但 line {co_field['line']} 不匹配",
+                "evidence_refs": refs + [
+                    _ref_repo(co_field["file"], commit,
+                              f"{max(1, s-5)}-{e+5}",
+                              near.data["snippet"]),
+                ]}
 
     # 用 grep 兜底
     grep = tools.grep_code(co.data["cwd"], co_field["file"], re.escape(co_field["code"].strip()))
     if grep.ok and grep.data["hits"]:
         first = grep.data["hits"][0]
         return {"status": "incorrect", "confidence": 0.85,
-                "evidence": f"行号错误：实际匹配行 {first['line']}，标注 {co_field['line']}（{first['text'][:80]}）"}
+                "evidence": f"行号错误：实际匹配行 {first['line']}，标注 {co_field['line']}（{first['text'][:80]}）",
+                "evidence_refs": refs + [
+                    _ref_repo(co_field["file"], commit, first["line"], first["text"]),
+                ]}
 
     return {"status": "incorrect", "confidence": 0.85,
-            "evidence": f"代码片段不匹配：actual={actual[:80]} expected={expected[:80]}"}
+            "evidence": f"代码片段不匹配：actual={actual[:80]} expected={expected[:80]}",
+            "evidence_refs": refs}
 
 
 def check_commit(entry: Dict[str, Any], tools: VulnGymTools) -> Dict[str, Any]:
     commit = entry.get("commit", "")
     if not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
         return {"status": "incorrect", "confidence": 0.99,
-                "evidence": f"commit 不是 40 位小写 hex：{commit!r}"}
+                "evidence": f"commit 不是 40 位小写 hex：{commit!r}",
+                "evidence_refs": []}
     project = normalize_project_from_repo(entry["repo_url"])
     co = tools.checkout(project, commit)
     if not co.ok:
         return {"status": "incorrect", "confidence": 0.90,
-                "evidence": f"commit 在本地缓存中不可用：{co.error}"}
+                "evidence": f"commit 在本地缓存中不可用：{co.error}",
+                "evidence_refs": []}
+    # 进一步用 git_log 拿一条历史作为 git 引用
+    gl = tools.git_log(project, commit, limit=1)
+    refs: List[Dict[str, str]] = [
+        _ref_repo("<manifest>", commit, "0", f"commit {commit} exists in repo_cache"),
+    ]
+    if gl.ok and gl.data:
+        first = gl.data[0]
+        refs.append(_ref_git(project, commit, first["sha"], first.get("message", "")))
     return {"status": "correct", "confidence": 0.90,
-            "evidence": f"commit {commit[:7]} 在本地缓存可用，且格式合规"}
+            "evidence": f"commit {commit[:7]} 在本地缓存可用，且格式合规",
+            "evidence_refs": refs}
 
 
 def check_vuln_ids(
@@ -152,17 +250,26 @@ def check_vuln_ids(
     ids = entry.get("vuln_ids", []) or []
     if not ids:
         return {"status": "uncertain", "confidence": 0.50,
-                "evidence": "vuln_ids 为空，需要公告或人工补全"}
+                "evidence": "vuln_ids 为空，需要公告或人工补全",
+                "evidence_refs": []}
     expected_cve = advisory.get("cve_id")
     expected_ghsa = advisory.get("ghsa_id")
+    refs: List[Dict[str, str]] = []
+    if expected_cve:
+        refs.append(_ref_advisory("advisory.json#cve_id", expected_cve))
+    if expected_ghsa:
+        refs.append(_ref_advisory("advisory.json#ghsa_id", expected_ghsa))
     if expected_cve and expected_cve not in ids:
         return {"status": "incorrect", "confidence": 0.85,
-                "evidence": f"vuln_ids 缺少公告中的 CVE：{expected_cve}"}
+                "evidence": f"vuln_ids 缺少公告中的 CVE：{expected_cve}",
+                "evidence_refs": refs}
     if expected_ghsa and expected_ghsa not in ids:
         return {"status": "uncertain", "confidence": 0.55,
-                "evidence": f"vuln_ids 缺少公告中的 GHSA：{expected_ghsa}"}
+                "evidence": f"vuln_ids 缺少公告中的 GHSA：{expected_ghsa}",
+                "evidence_refs": refs}
     return {"status": "correct", "confidence": 0.90,
-            "evidence": f"vuln_ids={ids} 与公告一致"}
+            "evidence": f"vuln_ids={ids} 与公告一致",
+            "evidence_refs": refs}
 
 
 def check_vuln_title(
@@ -172,9 +279,13 @@ def check_vuln_title(
 ) -> Dict[str, Any]:
     expected = advisory.get("title", "")
     actual = entry.get("vuln_title", "")
+    refs: List[Dict[str, str]] = []
+    if expected:
+        refs.append(_ref_advisory("advisory.json#title", expected))
     if not expected:
         return {"status": "uncertain", "confidence": 0.50,
-                "evidence": "公告标题缺失，触发 LLM 语义判断"}
+                "evidence": "公告标题缺失，触发 LLM 语义判断",
+                "evidence_refs": refs}
     prompt = (
         f"判断 vuln_title 是否正确。\n"
         f"advisory title: {expected}\n"
@@ -188,12 +299,14 @@ def check_vuln_title(
         data.setdefault("status", "uncertain")
         data.setdefault("confidence", 0.50)
         data.setdefault("evidence", "LLM 语义判断")
+        data.setdefault("evidence_refs", refs)
         return data
     except Exception:
         # 回退：简单包含
         ok = expected[:10] in actual or actual[:10] in expected
         return {"status": "correct" if ok else "uncertain", "confidence": 0.50,
-                "evidence": "LLM 输出解析失败，回退到关键词包含判断"}
+                "evidence": "LLM 输出解析失败，回退到关键词包含判断",
+                "evidence_refs": refs}
 
 
 def check_category(
@@ -204,9 +317,13 @@ def check_category(
 ) -> Dict[str, Any]:
     actual = entry.get(f"vuln_category_{level}", "")
     expected = advisory.get(f"vuln_category_{level}_hint", "")
+    refs: List[Dict[str, str]] = []
+    if expected:
+        refs.append(_ref_advisory(f"advisory.json#vuln_category_{level}_hint", expected))
     if not expected:
         return {"status": "uncertain", "confidence": 0.50,
-                "evidence": f"公告未给出 l{level[-1]} 提示，需人工判定"}
+                "evidence": f"公告未给出 l{level[-1]} 提示，需人工判定",
+                "evidence_refs": refs}
     prompt = (
         f"判断 vuln_category_{level} 是否正确。\n"
         f"advisory_hint_l{level[-1]}: {expected}\n"
@@ -220,10 +337,12 @@ def check_category(
         data.setdefault("status", "uncertain")
         data.setdefault("confidence", 0.50)
         data.setdefault("evidence", "LLM 语义判断")
+        data.setdefault("evidence_refs", refs)
         return data
     except Exception:
         return {"status": "uncertain", "confidence": 0.40,
-                "evidence": "LLM 输出不可解析"}
+                "evidence": "LLM 输出不可解析",
+                "evidence_refs": refs}
 
 
 def check_trace(
@@ -235,29 +354,37 @@ def check_trace(
     trace = entry.get("trace", []) or []
     if not trace:
         return {"status": "uncertain", "confidence": 0.40,
-                "evidence": "trace 为空（可能合理，但无法验证）"}
+                "evidence": "trace 为空（可能合理，但无法验证）",
+                "evidence_refs": []}
 
     project = normalize_project_from_repo(entry["repo_url"])
     co = tools.checkout(project, entry["commit"])
     if not co.ok:
         return {"status": "incorrect", "confidence": 0.90,
-                "evidence": f"trace 校验前置失败：{co.error}"}
+                "evidence": f"trace 校验前置失败：{co.error}",
+                "evidence_refs": []}
 
     bad_nodes = []
+    refs: List[Dict[str, str]] = []
     for idx, node in enumerate(trace):
         reads = tools.read_file_lines(co.data["cwd"], node["file"],
                                       *_line_range(node["line"]))
         if not reads.ok:
             bad_nodes.append(f"#{idx} 文件不存在 {node['file']}")
+            refs.append(_ref_repo(node["file"], entry["commit"], node["line"],
+                                  f"file not found: {node['file']}"))
             continue
         actual = _norm_code(reads.data["snippet"])
         expected = _norm_code(node["code"])
+        refs.append(_ref_repo(node["file"], entry["commit"], node["line"],
+                              reads.data["snippet"]))
         if expected not in actual and actual not in expected:
             bad_nodes.append(f"#{idx} {node['file']}:{node['line']} 代码片段不匹配")
 
     if bad_nodes:
         return {"status": "incorrect", "confidence": 0.85,
-                "evidence": "trace 节点异常：" + "; ".join(bad_nodes[:3])}
+                "evidence": "trace 节点异常：" + "; ".join(bad_nodes[:3]),
+                "evidence_refs": refs}
 
     # 节点级都对，再让 LLM 判断"整体合理性"
     prompt = (
@@ -273,14 +400,16 @@ def check_trace(
         data.setdefault("status", "uncertain")
         data.setdefault("confidence", 0.50)
         data.setdefault("evidence", "LLM 语义判断")
+        data.setdefault("evidence_refs", refs)
         return data
     except Exception:
         return {"status": "uncertain", "confidence": 0.50,
-                "evidence": "LLM 输出不可解析"}
+                "evidence": "LLM 输出不可解析",
+                "evidence_refs": refs}
 
 
 # ============================================================
-# 汇总：跑一条 entry 的全部字段
+# 汇总：跑一条 entry 的全部字段（**逻辑不变**，ISSUE_OUTLINE §5 I3 明确禁止修改）
 # ============================================================
 def check_all_fields(
     entry: Dict[str, Any],
@@ -298,15 +427,19 @@ def check_all_fields(
     fields["vuln_ids"] = check_vuln_ids(entry, advisory) if advisory else {
         "status": "uncertain", "confidence": 0.40,
         "evidence": "公告缓存缺失，无法校验 vuln_ids",
+        "evidence_refs": [],
     }
     fields["vuln_title"] = check_vuln_title(entry, advisory, llm) if advisory else {
         "status": "uncertain", "confidence": 0.40, "evidence": "公告缓存缺失",
+        "evidence_refs": [],
     }
     fields["vuln_category_l1"] = check_category("l1", entry, advisory, llm) if advisory else {
         "status": "uncertain", "confidence": 0.40, "evidence": "公告缓存缺失",
+        "evidence_refs": [],
     }
     fields["vuln_category_l2"] = check_category("l2", entry, advisory, llm) if advisory else {
         "status": "uncertain", "confidence": 0.40, "evidence": "公告缓存缺失",
+        "evidence_refs": [],
     }
     fields["trace"] = check_trace(entry, tools, llm)
 

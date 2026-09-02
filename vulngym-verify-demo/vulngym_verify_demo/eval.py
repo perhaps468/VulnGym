@@ -140,6 +140,11 @@ def evaluate(
                 field_total += 1
                 field_breakdown[f]["total"] += 1
                 gold_status = g["fields"].get(f)
+                # 防御：如果 gold 缺少该字段，跳过（不计入统计）
+                if gold_status is None:
+                    field_total -= 1
+                    field_breakdown[f]["total"] -= 1
+                    continue
                 report_status = (r.get("fields", {}).get(f) or {}).get("status")
                 if report_status == gold_status:
                     field_hit += 1

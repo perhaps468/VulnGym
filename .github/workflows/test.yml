@@ -1,0 +1,30 @@
+name: VulnGym T1 CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: pip install pytest
+      
+      - name: Run pytest
+        run: pytest tests/ -v
+      
+      - name: Smoke test
+        run: |
+          cd vulngym-verify-demo
+          python -m vulngym_verify_demo \
+            --entries public_fixtures/entries.jsonl \
+            --repo-cache mock_repo \
+            --advisories mock_advisories \
+            --out /tmp/reports_ci.jsonl \
+            --llm mock \
+            --bench

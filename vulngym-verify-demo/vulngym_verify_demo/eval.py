@@ -38,7 +38,12 @@ ALL_FIELDS = (
 
 
 def load_gold(path: Path) -> Dict[str, Dict[str, Any]]:
-    """读 gold.jsonl -> {entry_id: gold_dict}"""
+    """读 gold.jsonl -> {entry_id: gold_dict}
+    
+    支持两种格式：
+    1. 兼容格式：{"verdict": "...", "incorrect_fields": [...]}
+    2. 显式三态格式：{"verdict": "...", "fields": {"entry_point": "correct", ...}}
+    """
     gold: Dict[str, Dict[str, Any]] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -47,10 +52,17 @@ def load_gold(path: Path) -> Dict[str, Dict[str, Any]]:
                 continue
             row = json.loads(line)
             eid = row["entry_id"]
-            gold[eid] = {
-                "verdict": row["verdict"],
-                "incorrect_fields": list(row.get("incorrect_fields", []) or []),
-            }
+            gold_entry = {"verdict": row["verdict"]}
+            
+            # 如果有显式三态 fields，保留它
+            if "fields" in row:
+                gold_entry["fields"] = row["fields"]
+            
+            # 如果有 incorrect_fields，保留它（兼容格式）
+            if "incorrect_fields" in row:
+                gold_entry["incorrect_fields"] = list(row.get("incorrect_fields", []) or [])
+            
+            gold[eid] = gold_entry
     return gold
 
 
@@ -81,31 +93,79 @@ def evaluate(
     verdict_hit = 0
     per_entry: List[Dict[str, Any]] = []
 
-    for r in reports:
-        eid = r.get("entry_id")
-        g = gold.get(eid)
-        if g is None:
+    # 将 reports 转为 {entry_id: report} 映射
+    reports_map = {r["entry_id"]: r for r in reports}
+
+    for eid, g in gold.items():
+        r = reports_map.get(eid)
+        
+        # 缺失报告：所有字段计错
+        if not r:
+            for f in ALL_FIELDS:
+                field_total += 1
+                field_breakdown[f]["total"] += 1
+            # 如果 gold verdict 是 incorrect，计入错误召回分母
+            if g["verdict"] == "incorrect" or g.get("incorrect_fields"):
+                error_total += 1
+            verdict_total += 1
+            per_entry.append({
+                "entry_id": eid,
+                "verdict_pred": None,
+                "verdict_gold": g["verdict"],
+                "incorrect_pred": [],
+                "incorrect_gold": g.get("incorrect_fields", []),
+            })
             continue
-        # 其他字段的金标从 entry verdict 推断
-        if g["verdict"] == "correct":
-            default_field_status = "correct"
+        
+        # 特殊处理 __invalid_input__ 样本
+        if eid.startswith("__invalid_input__"):
+            verdict_total += 1
+            if r.get("verdict") == "uncertain" and g["verdict"] == "uncertain":
+                verdict_hit += 1
+            per_entry.append({
+                "entry_id": eid,
+                "verdict_pred": r.get("verdict"),
+                "verdict_gold": g["verdict"],
+                "incorrect_pred": [],
+                "incorrect_gold": [],
+            })
+            continue
+        
+        # 检测 gold 格式：是否有显式三态 fields
+        has_explicit_fields = "fields" in g and isinstance(g["fields"], dict)
+        
+        if has_explicit_fields:
+            # 显式三态格式：逐字段比对
+            for f in ALL_FIELDS:
+                field_total += 1
+                field_breakdown[f]["total"] += 1
+                gold_status = g["fields"].get(f)
+                report_status = (r.get("fields", {}).get(f) or {}).get("status")
+                if report_status == gold_status:
+                    field_hit += 1
+                    field_breakdown[f]["hit"] += 1
         else:
-            default_field_status = "uncertain"
-        # 字段级
-        for f in ALL_FIELDS:
-            actual_status = (r.get("fields", {}).get(f) or {}).get("status")
-            gold_flag = (
-                "incorrect"
-                if f in g["incorrect_fields"]
-                else default_field_status
-            )
-            field_total += 1
-            field_breakdown[f]["total"] += 1
-            if actual_status == gold_flag:
-                field_hit += 1
-                field_breakdown[f]["hit"] += 1
+            # 兼容格式：用 verdict 推断默认状态
+            if g["verdict"] == "correct":
+                default_field_status = "correct"
+            else:
+                default_field_status = "uncertain"
+            
+            for f in ALL_FIELDS:
+                field_total += 1
+                field_breakdown[f]["total"] += 1
+                actual_status = (r.get("fields", {}).get(f) or {}).get("status")
+                gold_flag = (
+                    "incorrect"
+                    if f in g.get("incorrect_fields", [])
+                    else default_field_status
+                )
+                if actual_status == gold_flag:
+                    field_hit += 1
+                    field_breakdown[f]["hit"] += 1
+        
         # 找错召回：entry 含任何 incorrect 字段算"需要被找出"
-        needs_incorrect = bool(g["incorrect_fields"])
+        needs_incorrect = bool(g.get("incorrect_fields", []))
         if needs_incorrect:
             error_total += 1
             found = any(
@@ -114,33 +174,35 @@ def evaluate(
             )
             if found:
                 error_hit += 1
+        
         # 整体 verdict
         verdict_total += 1
         if r.get("verdict") == g["verdict"]:
             verdict_hit += 1
-        per_entry.append(
-            {
-                "entry_id": eid,
-                "verdict_pred": r.get("verdict"),
-                "verdict_gold": g["verdict"],
-                "incorrect_pred": [
-                    f
-                    for f, v in (r.get("fields") or {}).items()
-                    if (v or {}).get("status") == "incorrect"
-                ],
-                "incorrect_gold": g["incorrect_fields"],
-            }
-        )
+        
+        per_entry.append({
+            "entry_id": eid,
+            "verdict_pred": r.get("verdict"),
+            "verdict_gold": g["verdict"],
+            "incorrect_pred": [
+                f
+                for f, v in (r.get("fields") or {}).items()
+                if (v or {}).get("status") == "incorrect"
+            ],
+            "incorrect_gold": g.get("incorrect_fields", []),
+        })
 
     metrics = {
         "n_entries": verdict_total,
         "field_accuracy": (field_hit / field_total) if field_total else 0.0,
-        "error_recall": (error_hit / error_total) if error_total else 0.0,
-        "verdict_accuracy": (verdict_hit / verdict_total) if verdict_total else 0.0,
+        "error_recall": (error_hit / error_total) if error_total else 1.0,
+        "verdict_accuracy": (verdict_hit / verdict_total) if verdict_total else 1.0,
         "field_total": field_total,
         "field_hit": field_hit,
         "error_total": error_total,
         "error_hit": error_hit,
+        "verdict_total": verdict_total,
+        "verdict_correct": verdict_hit,
         "per_entry": per_entry,
     }
     metrics["field_breakdown"] = {

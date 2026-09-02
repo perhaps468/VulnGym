@@ -35,11 +35,22 @@ except Exception:
 
 
 def iter_jsonl(path: Path) -> Iterable[dict]:
+    """迭代读取 JSONL，坏 JSON 行生成特殊标记而非抛异常。"""
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             line = line.strip()
-            if line:
+            if not line:  # 空行跳过
+                continue
+            try:
                 yield json.loads(line)
+            except json.JSONDecodeError as e:
+                # 生成特殊标记，交给 verify_entries 处理
+                yield {
+                    "__parse_error__": True,
+                    "__line_no__": line_no,
+                    "__error_message__": str(e),
+                    "__raw_line__": line[:100]  # 只保留前 100 字符
+                }
 
 
 def write_jsonl(path: Path, rows: List[dict]) -> None:
@@ -61,11 +72,19 @@ def print_summary(reports: List[dict]) -> None:
     print(f"{'entry_id':<12} {'report_id':<24} {'verdict':<10} summary")
     print("-" * 72)
     for r in reports:
+        entry_id = r.get('entry_id') or ""
+        report_id = r.get('report_id') or ""
         print(
-            f"{r['entry_id']:<12} {r['report_id']:<24} "
+            f"{entry_id:<12} {report_id:<24} "
             f"{r['verdict']:<10} {r['summary']}"
         )
     print("=" * 72)
+
+
+def expand_path(p: str) -> Path:
+    """展开 ~、环境变量，转绝对路径。"""
+    import os
+    return Path(os.path.expanduser(os.path.expandvars(p))).resolve()
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -98,10 +117,11 @@ def main(argv: List[str] | None = None) -> int:
     if args.bench and not args.gold:
         args.gold = "mock_data/gold.jsonl"
 
-    entries_path = Path(args.entries)
-    repo_cache = Path(args.repo_cache)
-    advisory_dir = Path(args.advisories)
-    out_path = Path(args.out)
+    # 路径规范化：支持相对路径、~、环境变量
+    entries_path = expand_path(args.entries)
+    repo_cache = expand_path(args.repo_cache)
+    advisory_dir = expand_path(args.advisories)
+    out_path = expand_path(args.out)
 
     if not entries_path.exists():
         print(f"[ERROR] entries file not found: {entries_path}", file=sys.stderr)
@@ -121,10 +141,10 @@ def main(argv: List[str] | None = None) -> int:
     print_summary(reports)
 
     if args.gold:
-        gold_path = Path(args.gold)
+        gold_path = expand_path(args.gold)
         if not gold_path.exists():
             print(f"[ERROR] gold file not found: {gold_path}", file=sys.stderr)
-            return 3
+            return 2
         gold = load_gold(gold_path)
         metrics = evaluate(reports, gold)
         print()

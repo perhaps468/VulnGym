@@ -1,0 +1,84 @@
+{
+  "schema_version": "v1",
+  "description": "mock_repo manifest — each item is one (project, commit, file) snapshot",
+  "items": [
+    {
+      "repo_url": "https://github.com/example/blog-platform",
+      "project": "blog-platform",
+      "commit": "1111111111111111111111111111111111111111",
+      "version": "v0.1.4",
+      "role": "vulnerable",
+      "file": "src/handlers/comment.js",
+      "targets": [{"line": 97, "code": "insertTextHandler(data.content);"}]
+    },
+    {
+      "repo_url": "https://github.com/example/blog-platform",
+      "project": "blog-platform",
+      "commit": "1111111111111111111111111111111111111111",
+      "version": "v0.1.4",
+      "role": "vulnerable",
+      "file": "src/lib/RichTextInput.svelte",
+      "targets": [
+        {"line": 343, "code": "    renderRichText(content);"},
+        {"line": 348, "code": "    tempDiv.innerHTML = htmlContent;"}
+      ]
+    },
+    {
+      "repo_url": "https://github.com/example/shell-runner",
+      "project": "shell-runner",
+      "commit": "2222222222222222222222222222222222222222",
+      "version": "v0.1.4",
+      "role": "vulnerable",
+      "file": "src/api.js",
+      "targets": [{"line": 42, "code": "spawn(\"sh\", [\"-c\", cmd]);"}]
+    },
+    {
+      "repo_url": "https://github.com/example/shell-runner",
+      "project": "shell-runner",
+      "commit": "2222222222222222222222222222222222222222",
+      "version": "v0.1.4",
+      "role": "vulnerable",
+      "file": "src/runner.js",
+      "targets": [{"line": 250, "code": "child_process.exec(userInput);"}]
+    },
+    {
+      "repo_url": "https://github.com/example/cmd-typo",
+      "project": "cmd-typo",
+      "commit": "3333333333333333333333333333333333333333",
+      "version": "v0.1.4",
+      "role": "vulnerable",
+      "file": "src/route.js",
+      "targets": [{"line": 17, "code": "processCommand(req.query.cmd);"}]
+    },
+    {
+      "repo_url": "https://github.com/example/cmd-typo",
+      "project": "cmd-typo",
+      "commit": "3333333333333333333333333333333333333333",
+      "version": "v0.1.4",
+      "role": "vulnerable",
+      "file": "src/exec.js",
+      "targets": [
+        {"line": 30, "code": "    return exec(cmd);"},
+        {"line": 33, "code": "    spawn(\"/bin/sh\", [req.query.cmd]);"}
+      ]
+    },
+    {
+      "repo_url": "https://github.com/example/auth-svc",
+      "project": "auth-svc",
+      "commit": "4444444444444444444444444444444444444444",
+      "version": "v0.1.4",
+      "role": "fixed",
+      "file": "src/middleware.js",
+      "targets": [{"line": 88, "code": "checkRole(req.user, role);"}]
+    },
+    {
+      "repo_url": "https://github.com/example/auth-svc",
+      "project": "auth-svc",
+      "commit": "4444444444444444444444444444444444444444",
+      "version": "v0.1.4",
+      "role": "fixed",
+      "file": "src/policy.js",
+      "targets": [{"line": 156, "code": "if (user.role !== requiredRole) throw new Forbidden();"}]
+    }
+  ]
+}

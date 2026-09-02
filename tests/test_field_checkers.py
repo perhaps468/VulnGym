@@ -92,6 +92,17 @@ def tools(tmp_workspace) -> VulnGymTools:
 
 
 @pytest.fixture
+def tools_with_manifest(tmp_workspace, manifest) -> VulnGymTools:
+    """注入 manifest 的 tools，用于测试 commit layer 3 (公告范围) 判定。"""
+    repo_cache, advisory_dir = tmp_workspace
+    return VulnGymTools(
+        repo_cache_dir=repo_cache,
+        advisory_dir=advisory_dir,
+        manifest=manifest,
+    )
+
+
+@pytest.fixture
 def llm() -> ScriptedMockLLMClient:
     return ScriptedMockLLMClient()
 
@@ -570,3 +581,297 @@ class TestIntegrationWithI1Schema:
                 "entry_point",
             )
             assert errs == [], f"ref failed: {ref}, errs={errs}"
+
+
+# ============================================================
+# TestCommitLayer3 — I3 commit 三层判定（含 layer 3 公告范围）
+# ============================================================
+
+class TestCommitLayer3:
+    """I3 启动手册 §5 验收 2-3：commit 与公告受影响版本范围相容 + role 区分。"""
+
+    def test_role_vulnerable_version_in_affected_range_correct(
+        self, tools_with_manifest, manifest,
+    ):
+        """role=vulnerable 且项目版本在公告 affected_versions 范围内 → correct。"""
+        item = next(it for it in manifest["items"] if it["role"] == "vulnerable")
+        e = _base_entry(item)
+        # 找一个真实公告：blog 的 affected_versions=[< 1.4.2]，version=v0.1.4 在范围内
+        adv = {"affected_versions": ["< 1.4.2"], "fixed_in": "1.4.2"}
+        r = check_commit(e, tools_with_manifest, advisory=adv)
+        assert r["status"] == "correct"
+        assert "漏洞引入" in r["evidence"] or "在 affected_versions" in r["evidence"]
+        assert len(r["evidence_refs"]) >= 2  # repo + git
+
+    def test_role_fixed_version_below_fixed_in_returns_uncertain(
+        self, tools_with_manifest, manifest,
+    ):
+        """role=fixed 但项目版本 < 公告 fixed_in → uncertain（不能把修复当引入）。"""
+        item = next(it for it in manifest["items"] if it["role"] == "fixed")
+        e = _base_entry(item)
+        # auth-svc 真实版本 v0.1.4, fixed_in=3.1.0 → 不应判为修复 commit
+        adv = {"affected_versions": ["< 3.1.0"], "fixed_in": "3.1.0"}
+        r = check_commit(e, tools_with_manifest, advisory=adv)
+        assert r["status"] == "uncertain"
+        assert "fixed" in r["evidence"] and "fixed_in" in r["evidence"]
+        # 仍保留 repo + git 引用
+        assert len(r["evidence_refs"]) >= 2
+
+    def test_role_fixed_version_meets_fixed_in_returns_correct(
+        self, tools_with_manifest, manifest,
+    ):
+        """role=fixed 且项目版本 >= 公告 fixed_in → correct。"""
+        item = next(it for it in manifest["items"] if it["role"] == "fixed")
+        e = _base_entry(item)
+        # 模拟 manifest 实际版本高于 fixed_in 的情况（重写 manifest_item 的 version 字段）
+        # 通过传入 advisory 且 fixed_in 设为很小值
+        adv = {"affected_versions": ["< 3.1.0"], "fixed_in": "0.0.1"}
+        r = check_commit(e, tools_with_manifest, advisory=adv)
+        # v0.1.4 >= 0.0.1 → correct
+        assert r["status"] == "correct"
+        assert "修复版本" in r["evidence"]
+
+    def test_role_unknown_returns_uncertain(self, tools_with_manifest, manifest):
+        """role=unknown 无法判定语义角色 → uncertain。"""
+        # 动态注入一个 role=unknown 的 manifest item
+        adv_manifest = {"items": [dict(manifest["items"][0], role="unknown")]}
+        repo_cache = tools_with_manifest.repo_cache_dir
+        advisory_dir = tools_with_manifest.advisory_dir
+        tools = VulnGymTools(repo_cache, advisory_dir, manifest=adv_manifest)
+        e = _base_entry(manifest["items"][0])
+        adv = {"affected_versions": ["< 1.4.2"], "fixed_in": "1.4.2"}
+        r = check_commit(e, tools, advisory=adv)
+        assert r["status"] == "uncertain"
+        assert "unknown" in r["evidence"].lower()
+
+    def test_no_advisory_falls_through_to_correct(self, tools_with_manifest, manifest):
+        """无 advisory → fall through 到 format+cache correct（保持向后兼容）。"""
+        item = manifest["items"][0]
+        e = _base_entry(item)
+        r = check_commit(e, tools_with_manifest, advisory=None)
+        assert r["status"] == "correct"
+        assert len(r["evidence_refs"]) >= 2
+
+    def test_role_vulnerable_version_not_in_affected_returns_uncertain(
+        self, tools_with_manifest, manifest,
+    ):
+        """role=vulnerable 但项目版本不在公告范围内 → uncertain。"""
+        item = next(it for it in manifest["items"] if it["role"] == "vulnerable")
+        e = _base_entry(item)
+        # blog version=v0.1.4，但设 fixed_in=0.0.1 → affected_versions=[< 0.0.1]，
+        # v0.1.4 不在该范围内 → uncertain
+        adv = {"affected_versions": ["< 0.0.1"], "fixed_in": "0.0.1"}
+        r = check_commit(e, tools_with_manifest, advisory=adv)
+        assert r["status"] == "uncertain"
+
+    def test_advisory_without_range_info_falls_through(self, tools_with_manifest, manifest):
+        """advisory 存在但没有 affected_versions/fixed_in → fall through correct。"""
+        item = manifest["items"][0]
+        e = _base_entry(item)
+        adv = {"title": "Some Advisory"}  # 仅标题，无范围信息
+        r = check_commit(e, tools_with_manifest, advisory=adv)
+        assert r["status"] == "correct"
+
+
+# ============================================================
+# TestI4ContractFixes — LLM 失败一律 uncertain，无关键词启发式回退为 correct
+# ============================================================
+
+class TestI4ContractFixes:
+    """I4 契约：LLM 失败 / 不可解析 → semantic uncertain，禁止回退为 correct。"""
+
+    def test_llm_failure_returns_uncertain_not_correct(self, llm):
+        """LLM 输出非 JSON → uncertain（之前是 keyword 子串启发式回退 correct）。"""
+
+        class BrokenLLM:
+            name = "BrokenLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                # 完全不可解析的输出
+                return "totally not parseable json at all"
+
+        # 即使 advisory title 与 vuln_title 字面完全相同，也必须 uncertain
+        e = {"vuln_title": "Same Title"}
+        adv = {"title": "Same Title"}
+        r = check_vuln_title(e, adv, BrokenLLM())
+        assert r["status"] == "uncertain", (
+            f"I4 契约违反：LLM 失败时回退为 {r['status']!r}，应始终为 uncertain"
+        )
+        # advisory ref 仍保留
+        assert any(ref["source"] == "advisory" for ref in r["evidence_refs"])
+
+    def test_category_llm_failure_returns_uncertain(self, llm):
+        """category LLM 失败 → uncertain。"""
+
+        class BrokenLLM:
+            name = "BrokenLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                return "not json"
+
+        e = {"vuln_category_l1": "XSS"}
+        adv = {"vuln_category_l1_hint": "XSS"}
+        r = check_category("l1", e, adv, BrokenLLM())
+        assert r["status"] == "uncertain"
+
+    def test_trace_llm_failure_returns_uncertain(self, tools, manifest):
+        """trace LLM 失败 → uncertain。"""
+
+        class BrokenLLM:
+            name = "BrokenLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                return "not json"
+
+        item = manifest["items"][0]
+        e = _base_entry(item)
+        r = check_trace(e, tools, BrokenLLM())
+        assert r["status"] == "uncertain"
+
+    def test_llm_success_uses_versioned_prompt(self, llm):
+        """LLM 实际接收到的 prompt 必须包含 [PROMPT_VERSION=...] 前缀。"""
+        captured = []
+
+        class CaptureLLM:
+            name = "CaptureLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                captured.append(messages[0].content)
+                return json.dumps({
+                    "status": "correct", "confidence": 0.9,
+                    "evidence": "ok", "evidence_refs": [],
+                })
+
+        e = {"vuln_title": "X"}
+        adv = {"title": "Y"}
+        check_vuln_title(e, adv, CaptureLLM())
+        assert len(captured) == 1
+        assert "[PROMPT_VERSION=vuln_title_judge@1]" in captured[0]
+
+    def test_category_uses_versioned_prompt(self):
+        """category LLM 接收到的 prompt 包含 [PROMPT_VERSION=vuln_category_l1_judge@1]。"""
+        captured = []
+
+        class CaptureLLM:
+            name = "CaptureLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                captured.append(messages[0].content)
+                return json.dumps({
+                    "status": "correct", "confidence": 0.9,
+                    "evidence": "ok", "evidence_refs": [],
+                })
+
+        e = {"vuln_category_l1": "X"}
+        adv = {"vuln_category_l1_hint": "X"}
+        check_category("l1", e, adv, CaptureLLM())
+        assert "[PROMPT_VERSION=vuln_category_l1_judge@1]" in captured[0]
+
+    def test_trace_uses_versioned_prompt(self, tools, manifest):
+        """trace LLM 接收到的 prompt 包含 [PROMPT_VERSION=trace_overall_judge@1]。"""
+        captured = []
+
+        class CaptureLLM:
+            name = "CaptureLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                captured.append(messages[0].content)
+                return json.dumps({
+                    "status": "correct", "confidence": 0.9,
+                    "evidence": "ok", "evidence_refs": [],
+                })
+
+        item = manifest["items"][0]
+        e = _base_entry(item)
+        check_trace(e, tools, CaptureLLM())
+        assert any(
+            "[PROMPT_VERSION=trace_overall_judge@1]" in m for m in captured
+        ), f"trace prompt should contain version prefix, got: {captured}"
+
+    def test_evidence_redacted_at_call_site(self, llm):
+        """parse_structured_response 在调用点生效：含路径的 evidence 会被脱敏。"""
+
+        class LeakyLLM:
+            name = "LeakyLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                return json.dumps({
+                    "status": "incorrect",
+                    "confidence": 0.8,
+                    "evidence": "see C:\\Users\\secret\\admin.txt for details",
+                    "evidence_refs": [],
+                })
+
+        e = {"vuln_title": "X"}
+        adv = {"title": "Y"}
+        r = check_vuln_title(e, adv, LeakyLLM())
+        # evidence 中不能含原始绝对路径
+        assert "C:\\Users\\secret" not in r["evidence"]
+        assert "<abspath>" in r["evidence"]
+
+    def test_invalid_status_from_llm_downgraded_to_uncertain(self):
+        """LLM 返回非法 status（如 "maybe"）→ uncertain（parse 阶段就纠正）。"""
+
+        class WeirdLLM:
+            name = "WeirdLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                return json.dumps({
+                    "status": "maybe-correct-ish",
+                    "confidence": 1.7,  # 也越界
+                    "evidence": "ok",
+                    "evidence_refs": [],
+                })
+
+        e = {"vuln_title": "X"}
+        adv = {"title": "Y"}
+        r = check_vuln_title(e, adv, WeirdLLM())
+        assert r["status"] == "uncertain"
+        assert 0.0 <= r["confidence"] <= 1.0
+
+
+# ============================================================
+# TestVersionHelpers — _parse_version / _version_cmp / _version_is_affected
+# ============================================================
+
+class TestVersionHelpers:
+    """版本解析与范围判定 helper 函数单元测试。"""
+
+    def test_parse_version_with_v_prefix(self):
+        from vulngym_verify_demo.field_checkers import _parse_version
+        assert _parse_version("v0.1.4") == (0, 1, 4)
+        assert _parse_version("v1.4.2") == (1, 4, 2)
+        assert _parse_version("v3.1.0") == (3, 1, 0)
+
+    def test_parse_version_without_v_prefix(self):
+        from vulngym_verify_demo.field_checkers import _parse_version
+        assert _parse_version("1.4.2") == (1, 4, 2)
+        assert _parse_version("0.9.5") == (0, 9, 5)
+
+    def test_parse_version_two_segments(self):
+        from vulngym_verify_demo.field_checkers import _parse_version
+        assert _parse_version("1.4") == (1, 4, 0)
+
+    def test_parse_version_invalid(self):
+        from vulngym_verify_demo.field_checkers import _parse_version
+        assert _parse_version("") is None
+        assert _parse_version("abc") is None
+        assert _parse_version(None) is None
+        assert _parse_version(123) is None
+
+    def test_version_cmp_basic(self):
+        from vulngym_verify_demo.field_checkers import _version_cmp
+        assert _version_cmp("0.1.4", "1.4.2") == -1
+        assert _version_cmp("1.4.2", "0.1.4") == 1
+        assert _version_cmp("1.4.2", "1.4.2") == 0
+
+    def test_version_is_affected_in_range(self):
+        from vulngym_verify_demo.field_checkers import _version_is_affected
+        assert _version_is_affected("0.1.4", ["< 1.4.2"]) is True
+        assert _version_is_affected("1.4.2", ["< 1.4.2"]) is False
+        assert _version_is_affected("2.0.0", ["< 1.4.2"]) is False
+
+    def test_version_is_affected_empty(self):
+        from vulngym_verify_demo.field_checkers import _version_is_affected
+        assert _version_is_affected("1.0.0", []) is None
+        assert _version_is_affected("1.0.0", None) is None

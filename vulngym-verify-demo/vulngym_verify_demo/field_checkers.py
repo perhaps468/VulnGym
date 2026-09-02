@@ -27,8 +27,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .llm_client import BaseLLMClient, LLMMessage
+from .llm_client import BaseLLMClient, LLMMessage, parse_structured_response
 from .tools import ToolResult, VulnGymTools, normalize_project_from_repo
+from .prompts import (
+    TRACE_OVERALL_PROMPT,
+    VULN_TITLE_PROMPT,
+    vuln_category_prompt,
+)
 # 避免循环导入：models.py 末尾会 import field_checkers，所以这里不能用
 # `from .models import EvidenceRef`。直接用具名字典构造（schema.py §4.1
 # 与 validate_evidence_ref 完全兼容），并在 to_dict 输出时保持同构。
@@ -97,6 +102,94 @@ def _norm_code(code: str) -> str:
     # 归一化工具 1/2：把连续空白(空格/制表/换行)折叠成单空格
     # 目的：实测代码和标注代码常常只是缩进/换行不同，归一化后方便做包含判定
     return re.sub(r"\s+", " ", (code or "").strip())
+
+
+# ============================================================
+# I3 Layer-3: 版本号解析与公告范围判定（I3 启动手册 §5 验收 2-3）
+# ============================================================
+
+_VERSION_RX = re.compile(r"v?(\d+)\.(\d+)(?:\.(\d+))?")
+
+
+def _parse_version(s: Any) -> Optional[Tuple[int, int, int]]:
+    """解析 '1.4.2' / 'v0.1.4' 为 (1,4,2) 元组；不可解析返回 None。"""
+    if not s or not isinstance(s, str):
+        return None
+    m = _VERSION_RX.fullmatch(s.strip())
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def _version_cmp(a: Any, b: Any) -> Optional[int]:
+    """比较两个版本；不可解析返回 None。"""
+    va, vb = _parse_version(a), _parse_version(b)
+    if va is None or vb is None:
+        return None
+    if va < vb:
+        return -1
+    if va > vb:
+        return 1
+    return 0
+
+
+def _version_is_affected(version: Any, affected_versions: Any) -> Optional[bool]:
+    """判定 version 是否落在 affected_versions 任何一个区间内。
+
+    返回：
+        True  - 落在区间（受影响）
+        False - 全部区间都不命中（不受影响）
+        None  - 无法判定（区间格式未知或 version 无法解析）
+
+    仅支持 ``< X.Y.Z`` 形式（与 mock advisories 当前形态一致）。
+    """
+    if not version or not affected_versions or not isinstance(affected_versions, list):
+        return None
+    any_decidable = False
+    for spec in affected_versions:
+        if not isinstance(spec, str):
+            return None
+        spec = spec.strip()
+        if spec.startswith("< "):
+            threshold = spec[2:].strip()
+            c = _version_cmp(version, threshold)
+            if c is not None:
+                any_decidable = True
+                if c < 0:
+                    return True
+        else:
+            # 不支持的范围表达式（如 "<="、">"、"="）→ 视为不可判定
+            return None
+    if any_decidable:
+        return False
+    return None
+
+
+def _version_meets_or_exceeds(version: Any, threshold: Any) -> Optional[bool]:
+    """判定 version >= threshold；不可解析返回 None。"""
+    if not version or not threshold:
+        return None
+    c = _version_cmp(version, threshold)
+    if c is None:
+        return None
+    return c >= 0
+
+
+def _merge_refs(*ref_lists: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """按 (source, locator, quote) 三键去重合并多组 refs。"""
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for refs in ref_lists:
+        if not refs:
+            continue
+        for r in refs:
+            if not isinstance(r, dict):
+                continue
+            key = (r.get("source"), r.get("locator"), r.get("quote"))
+            if key not in seen:
+                out.append(r)
+                seen.add(key)
+    return out
 
 
 # ============================================================
@@ -218,29 +311,122 @@ def check_critical_operation(
             "evidence_refs": refs}
 
 
-def check_commit(entry: Dict[str, Any], tools: VulnGymTools) -> Dict[str, Any]:
+def check_commit(
+    entry: Dict[str, Any],
+    tools: VulnGymTools,
+    advisory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """commit 字段三态判定（I3 启动手册 §5 验收 2-3）。
+
+    分层判定：
+        Layer 1 - 格式：40 位小写 hex，否则 incorrect
+        Layer 2 - 缓存可解析：tools.checkout 命中本地缓存，否则 incorrect
+        Layer 3 - 与公告范围相容：仅当 advisory 提供可验证范围
+                    （affected_versions / fixed_in）时执行，否则 fall-through 到
+                    format+cache 通过即 correct；版本无法解析时 uncertain
+        Role 区分（修复 vs 漏洞）：
+        - role=fixed 必须满足 version >= fixed_in，否则 uncertain（防止把修复 commit 当成引入）
+        - role=vulnerable 必须满足 version ∈ affected_versions，否则 uncertain
+        - role=unknown 直接判 uncertain（无法判定语义角色）
+    """
     commit = entry.get("commit", "")
+    # ---- Layer 1: 格式 ----
     if not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
         return {"status": "incorrect", "confidence": 0.99,
                 "evidence": f"commit 不是 40 位小写 hex：{commit!r}",
                 "evidence_refs": []}
+
     project = normalize_project_from_repo(entry["repo_url"])
+    # ---- Layer 2: 缓存可解析 ----
     co = tools.checkout(project, commit)
     if not co.ok:
         return {"status": "incorrect", "confidence": 0.90,
                 "evidence": f"commit 在本地缓存中不可用：{co.error}",
                 "evidence_refs": []}
-    # 进一步用 git_log 拿一条历史作为 git 引用
-    gl = tools.git_log(project, commit, limit=1)
+
     refs: List[Dict[str, str]] = [
         _ref_repo("<manifest>", commit, "0", f"commit {commit} exists in repo_cache"),
     ]
+    gl = tools.git_log(project, commit, limit=1)
     if gl.ok and gl.data:
         first = gl.data[0]
         refs.append(_ref_git(project, commit, first["sha"], first.get("message", "")))
+
+    # ---- Layer 3: 公告范围相容性 + role 区分 ----
+    if advisory:
+        affected = advisory.get("affected_versions") or []
+        fixed_in = advisory.get("fixed_in")
+        manifest_item = _lookup_manifest_item(tools, project, commit)
+        role = manifest_item.get("role") if manifest_item else None
+        project_version = manifest_item.get("version") if manifest_item else None
+
+        if role == "unknown":
+            return {
+                "status": "uncertain", "confidence": 0.55,
+                "evidence": (
+                    f"manifest 标记 role=unknown，无法判定 commit {commit[:7]} 是漏洞版本还是修复版本"
+                ),
+                "evidence_refs": refs,
+            }
+
+        if role == "fixed" and fixed_in:
+            meets = _version_meets_or_exceeds(project_version, fixed_in)
+            if meets is False:
+                return {
+                    "status": "uncertain", "confidence": 0.70,
+                    "evidence": (
+                        f"manifest 标记 role=fixed 但项目版本 {project_version} < 公告 fixed_in {fixed_in}；"
+                        f"无法确认 commit {commit[:7]} 是真正的修复 commit"
+                    ),
+                    "evidence_refs": refs,
+                }
+            if meets is True:
+                return {
+                    "status": "correct", "confidence": 0.92,
+                    "evidence": (
+                        f"commit {commit[:7]} 是修复版本（role=fixed, version={project_version} >= fixed_in={fixed_in}）"
+                    ),
+                    "evidence_refs": refs,
+                }
+            # meets is None：版本不可解析 → fall-through
+        elif role == "vulnerable" and affected:
+            in_range = _version_is_affected(project_version, affected)
+            if in_range is False:
+                return {
+                    "status": "uncertain", "confidence": 0.70,
+                    "evidence": (
+                        f"manifest 标记 role=vulnerable 但项目版本 {project_version} 不在公告 "
+                        f"affected_versions={affected} 范围内；无法确认 commit 是漏洞引入 commit"
+                    ),
+                    "evidence_refs": refs,
+                }
+            if in_range is True:
+                return {
+                    "status": "correct", "confidence": 0.92,
+                    "evidence": (
+                        f"commit {commit[:7]} 是漏洞引入版本（role=vulnerable, "
+                        f"version={project_version} ∈ affected_versions）"
+                    ),
+                    "evidence_refs": refs,
+                }
+            # in_range is None：版本不可解析 → fall-through
+
+    # 无 advisory 信息或 layer 3 无法判定 → 按格式+缓存通过算 correct
     return {"status": "correct", "confidence": 0.90,
             "evidence": f"commit {commit[:7]} 在本地缓存可用，且格式合规",
             "evidence_refs": refs}
+
+
+def _lookup_manifest_item(
+    tools: VulnGymTools, project: str, commit: str,
+) -> Optional[Dict[str, Any]]:
+    """从 tools.manifest 中按 (project, commit) 查找对应的 item。"""
+    if not tools.manifest or not tools.manifest.get("items"):
+        return None
+    for it in tools.manifest["items"]:
+        if it.get("project") == project and it.get("commit") == commit:
+            return it
+    return None
 
 
 def check_vuln_ids(
@@ -277,6 +463,15 @@ def check_vuln_title(
     advisory: Dict[str, Any],
     llm: BaseLLMClient,
 ) -> Dict[str, Any]:
+    """vuln_title 语义判定。
+
+    I4 契约：
+      - 必须走 `parse_structured_response`，让 schema/confidence/脱敏/非空 evidence
+        校验生效
+      - LLM 失败（非法 JSON / 超时 / HTTP 错误）一律 semantic uncertain，
+        禁止通过关键词启发式回退为 correct
+      - 使用 prompts.VULN_TITLE_PROMPT（带 [PROMPT_VERSION=...] 前缀）走版本化模板
+    """
     expected = advisory.get("title", "")
     actual = entry.get("vuln_title", "")
     refs: List[Dict[str, str]] = []
@@ -286,39 +481,12 @@ def check_vuln_title(
         return {"status": "uncertain", "confidence": 0.50,
                 "evidence": "公告标题缺失，触发 LLM 语义判断",
                 "evidence_refs": refs}
-    prompt = (
-        f"判断 vuln_title 是否正确。\n"
-        f"advisory title: {expected}\n"
-        f"actual: {actual}\n"
-        f"返回 JSON：{{status,confidence,evidence}}"
-    )
+    prompt = VULN_TITLE_PROMPT.format(expected=expected, actual=actual)
     out = llm.chat([LLMMessage("user", prompt)])
-    try:
-        import json
-        data = json.loads(out)
-        data.setdefault("status", "uncertain")
-        data.setdefault("confidence", 0.50)
-        data.setdefault("evidence", "LLM 语义判断")
-        # I4 修复：setdefault 在 mock 已有空列表时不会覆盖，改为 append-merge
-        existing = data.get("evidence_refs") or []
-        if not isinstance(existing, list):
-            existing = []
-        # 去重（按 source+locator+quote 三键）
-        seen = {(r.get("source"), r.get("locator"), r.get("quote"))
-                for r in existing if isinstance(r, dict)}
-        for r in refs:
-            key = (r.get("source"), r.get("locator"), r.get("quote"))
-            if key not in seen:
-                existing.append(r)
-                seen.add(key)
-        data["evidence_refs"] = existing
-        return data
-    except Exception:
-        # 回退：简单包含
-        ok = expected[:10] in actual or actual[:10] in expected
-        return {"status": "correct" if ok else "uncertain", "confidence": 0.50,
-                "evidence": "LLM 输出解析失败，回退到关键词包含判断",
-                "evidence_refs": refs}
+    data = parse_structured_response(out)
+    # I4 兼容：append-merge 模式（LLM 返回的 evidence_refs 与 advisory refs 合并去重）
+    data["evidence_refs"] = _merge_refs(data.get("evidence_refs") or [], refs)
+    return data
 
 
 def check_category(
@@ -327,6 +495,11 @@ def check_category(
     advisory: Dict[str, Any],
     llm: BaseLLMClient,
 ) -> Dict[str, Any]:
+    """vuln_category_l1 / l2 语义判定。
+
+    I4 契约：LLM 失败一律 uncertain；走 `parse_structured_response`；
+    使用 prompts.vuln_category_prompt() 版本化模板。
+    """
     actual = entry.get(f"vuln_category_{level}", "")
     expected = advisory.get(f"vuln_category_{level}_hint", "")
     refs: List[Dict[str, str]] = []
@@ -336,36 +509,11 @@ def check_category(
         return {"status": "uncertain", "confidence": 0.50,
                 "evidence": f"公告未给出 l{level[-1]} 提示，需人工判定",
                 "evidence_refs": refs}
-    prompt = (
-        f"判断 vuln_category_{level} 是否正确。\n"
-        f"advisory_hint_l{level[-1]}: {expected}\n"
-        f"actual: {actual}\n"
-        f"返回 JSON：{{status,confidence,evidence}}"
-    )
+    prompt = vuln_category_prompt(level, expected, actual)
     out = llm.chat([LLMMessage("user", prompt)])
-    try:
-        import json
-        data = json.loads(out)
-        data.setdefault("status", "uncertain")
-        data.setdefault("confidence", 0.50)
-        data.setdefault("evidence", "LLM 语义判断")
-        data.setdefault("evidence_refs", refs)
-        # I4 兼容：append-merge 模式（若 LLM 返回已有 evidence_refs，refs 也追加）
-        existing = data.get("evidence_refs") or []
-        if isinstance(existing, list) and refs:
-            seen = {(r.get("source"), r.get("locator"), r.get("quote"))
-                    for r in existing if isinstance(r, dict)}
-            for r in refs:
-                key = (r.get("source"), r.get("locator"), r.get("quote"))
-                if key not in seen:
-                    existing.append(r)
-                    seen.add(key)
-            data["evidence_refs"] = existing
-        return data
-    except Exception:
-        return {"status": "uncertain", "confidence": 0.40,
-                "evidence": "LLM 输出不可解析",
-                "evidence_refs": refs}
+    data = parse_structured_response(out)
+    data["evidence_refs"] = _merge_refs(data.get("evidence_refs") or [], refs)
+    return data
 
 
 def check_trace(
@@ -410,36 +558,13 @@ def check_trace(
                 "evidence_refs": refs}
 
     # 节点级都对，再让 LLM 判断"整体合理性"
-    prompt = (
-        f"trace 链路整体合理性判断。\n"
-        f"entry_id: {entry.get('entry_id')}\n"
-        f"trace 节点数: {len(trace)}\n"
-        f"返回 JSON：{{status,confidence,evidence}}"
+    prompt = TRACE_OVERALL_PROMPT.format(
+        entry_id=entry.get("entry_id", ""), node_count=len(trace),
     )
     out = llm.chat([LLMMessage("user", prompt)])
-    try:
-        import json
-        data = json.loads(out)
-        data.setdefault("status", "uncertain")
-        data.setdefault("confidence", 0.50)
-        data.setdefault("evidence", "LLM 语义判断")
-        data.setdefault("evidence_refs", refs)
-        # I4 兼容：append-merge 模式
-        existing = data.get("evidence_refs") or []
-        if isinstance(existing, list) and refs:
-            seen = {(r.get("source"), r.get("locator"), r.get("quote"))
-                    for r in existing if isinstance(r, dict)}
-            for r in refs:
-                key = (r.get("source"), r.get("locator"), r.get("quote"))
-                if key not in seen:
-                    existing.append(r)
-                    seen.add(key)
-            data["evidence_refs"] = existing
-        return data
-    except Exception:
-        return {"status": "uncertain", "confidence": 0.50,
-                "evidence": "LLM 输出不可解析",
-                "evidence_refs": refs}
+    data = parse_structured_response(out)
+    data["evidence_refs"] = _merge_refs(data.get("evidence_refs") or [], refs)
+    return data
 
 
 # ============================================================
@@ -457,7 +582,8 @@ def check_all_fields(
     fields: Dict[str, Dict[str, Any]] = {}
     fields["entry_point"] = check_entry_point(entry, tools, llm)
     fields["critical_operation"] = check_critical_operation(entry, tools, llm)
-    fields["commit"] = check_commit(entry, tools)
+    # check_commit 接收 advisory 以启用 layer 3 (公告范围 + role) 判定（I3 启动手册 §5）
+    fields["commit"] = check_commit(entry, tools, advisory=advisory) if advisory else check_commit(entry, tools)
     fields["vuln_ids"] = check_vuln_ids(entry, advisory) if advisory else {
         "status": "uncertain", "confidence": 0.40,
         "evidence": "公告缓存缺失，无法校验 vuln_ids",

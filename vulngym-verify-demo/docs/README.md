@@ -67,6 +67,20 @@
   - 字段类型、枚举、必填约束
   - 用于自动化校验
 
+### 7. Bonus 模块
+
+- **[ERROR_ATTRIBUTION.md](ERROR_ATTRIBUTION.md)** - I9 Bonus: 错误归因分析
+  - 跨报告聚合错误模式
+  - 工具/LLM 偏差统计
+  - 根因识别
+  - 修复建议生成
+
+- **[VISUALIZATION.md](VISUALIZATION.md)** - I10 Bonus: 推理链路可视化
+  - 推理过程可视化为 Mermaid 流程图
+  - 单报告/批量报告可视化
+  - 统计分析和对比
+  - 调试和审计工具
+
 ---
 
 ## 🎯 按使用场景导航

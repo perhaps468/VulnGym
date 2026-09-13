@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "vulngym-verify-demo"))
 
 from vulngym_verify_demo.field_checkers import (  # noqa: E402
+    BUNDLE_FIELDS,
     _ref_repo,
     _ref_git,
     _ref_advisory,
@@ -36,6 +37,7 @@ from vulngym_verify_demo.field_checkers import (  # noqa: E402
     check_vuln_title,
     check_category,
     check_trace,
+    check_semantic_bundle,
     check_all_fields,
 )
 from vulngym_verify_demo.schema import (  # noqa: E402
@@ -43,7 +45,7 @@ from vulngym_verify_demo.schema import (  # noqa: E402
     EVIDENCE_SOURCE_VALUES,
     STATUS_VALUES,
 )
-from vulngym_verify_demo.tools import VulnGymTools  # noqa: E402
+from vulngym_verify_demo.tools import ToolResult, VulnGymTools  # noqa: E402
 from vulngym_verify_demo.llm_client import ScriptedMockLLMClient  # noqa: E402
 
 
@@ -107,7 +109,7 @@ def llm() -> ScriptedMockLLMClient:
     return ScriptedMockLLMClient()
 
 
-def _base_entry(project_item: Dict[str, Any], report_id: str = "GHSA-DEMO-0001-XSS") -> Dict[str, Any]:
+def _base_entry(project_item: Dict[str, Any], report_id: str = "GHSA-DEMO-0001-0XSS") -> Dict[str, Any]:
     """构造一条完整 entry，指向 manifest 里的某个 project/commit/file。"""
     return {
         "entry_id": "entry-" + project_item["project"],
@@ -162,11 +164,11 @@ class TestRefFactories:
         assert "introduce" in r["quote"]
 
     def test_advisory_ref_shape(self):
-        r = _ref_advisory("advisory.json#cve_id", "CVE-2026-DEMO-0001")
+        r = _ref_advisory("advisory.json#cve_id", "CVE-2026-0001")
         assert r == {
             "source": "advisory",
             "locator": "advisory.json#cve_id",
-            "quote": "CVE-2026-DEMO-0001",
+            "quote": "CVE-2026-0001",
         }
 
     def test_all_sources_valid(self):
@@ -200,8 +202,8 @@ class TestEvidenceRefsShape:
 
     def test_check_vuln_ids_returns_list(self, manifest):
         e = _base_entry(manifest["items"][0])
-        e["vuln_ids"] = ["CVE-2026-DEMO-0001"]
-        adv = {"cve_id": "CVE-2026-DEMO-0001", "ghsa_id": "GHSA-DEMO-0001-XSS"}
+        e["vuln_ids"] = ["CVE-2026-0001"]
+        adv = {"cve_id": "CVE-2026-0001", "ghsa_id": "GHSA-DEMO-0001-0XSS"}
         r = check_vuln_ids(e, adv)
         assert isinstance(r["evidence_refs"], list)
 
@@ -308,9 +310,27 @@ class TestEntryPointRefs:
             "targets": [{"line": 1, "code": "x();"}],
         })
         r = check_entry_point(e, tools, llm)
-        assert r["status"] == "incorrect"
+        assert r["status"] == "uncertain"
         assert r["evidence_refs"] == []
         assert "checkout" in r["evidence"].lower() or "无法" in r["evidence"]
+
+    def test_repository_becoming_unavailable_is_uncertain(self, llm, manifest):
+        class RepositoryBecomesUnavailable:
+            def checkout(self, _project, _commit):
+                return ToolResult("checkout", True, {"cwd": "fixture://repo"})
+
+            def read_file_lines(self, _cwd, _file, _start, _end):
+                return ToolResult(
+                    "read_file_lines", False, None,
+                    "local clone is unavailable", "repo_unavailable",
+                )
+
+        result = check_entry_point(
+            _base_entry(manifest["items"][0]), RepositoryBecomesUnavailable(), llm,
+        )
+
+        assert result["status"] == "uncertain"
+        assert result["evidence_refs"] == []
 
 
 # ============================================================
@@ -334,6 +354,24 @@ class TestCriticalOpRefs:
         r = check_critical_operation(e, tools, llm)
         assert r["status"] == "incorrect"
         assert len(r["evidence_refs"]) >= 1
+
+    def test_repository_read_failure_is_uncertain(self, llm, manifest):
+        class RepositoryReadFails:
+            def checkout(self, _project, _commit):
+                return ToolResult("checkout", True, {"cwd": "fixture://repo"})
+
+            def read_file_lines(self, _cwd, _file, _start, _end):
+                return ToolResult(
+                    "read_file_lines", False, None,
+                    "permission denied", "permission_denied",
+                )
+
+        result = check_critical_operation(
+            _base_entry(manifest["items"][0]), RepositoryReadFails(), llm,
+        )
+
+        assert result["status"] == "uncertain"
+        assert result["evidence_refs"] == []
 
     def test_line_drift_near_window(self, tools, llm, manifest):
         item = manifest["items"][0]
@@ -370,20 +408,35 @@ class TestCommitRefs:
         e = _base_entry(manifest["items"][0])
         e["commit"] = "not-40-hex"
         r = check_commit(e, tools)
-        assert r["status"] == "incorrect"
+        assert r["status"] == "uncertain"
         assert r["evidence_refs"] == []
 
     def test_cache_miss_empty_refs(self, tools, manifest):
         e = _base_entry(manifest["items"][0])
         e["commit"] = "f" * 40  # 不在 manifest
         r = check_commit(e, tools)
-        assert r["status"] == "incorrect"
+        assert r["status"] == "uncertain"
         assert r["evidence_refs"] == []
+
+    def test_commit_missing_from_available_clone_is_incorrect(self, manifest):
+        class MissingCommitTools:
+            def checkout(self, _project, _commit):
+                return ToolResult(
+                    "checkout", False, None,
+                    "commit not available in local clone", "commit_missing",
+                )
+
+        result = check_commit(
+            _base_entry(manifest["items"][0]), MissingCommitTools(),
+        )
+
+        assert result["status"] == "incorrect"
+        assert result["evidence_refs"][0]["source"] == "git"
 
     def test_normal_match_fills_repo_and_git(self, tools, manifest):
         e = _base_entry(manifest["items"][0])
         r = check_commit(e, tools)
-        assert r["status"] == "correct"
+        assert r["status"] == "uncertain"
         sources = {ref["source"] for ref in r["evidence_refs"]}
         assert "repository" in sources
         assert "git" in sources
@@ -396,28 +449,35 @@ class TestCommitRefs:
 class TestVulnIdsRefs:
     """vuln_ids 3 种场景。"""
 
-    def test_missing_cve_in_advisory(self):
-        """entry 中缺 CVE（advisory 有） → incorrect + 填 advisory refs。"""
-        e = {"vuln_ids": ["GHSA-DEMO-0001-XSS"]}
-        adv = {"cve_id": "CVE-2026-DEMO-0001", "ghsa_id": "GHSA-DEMO-0001-XSS"}
+    def test_ghsa_only_is_supported_when_report_id_carries_other_ids(self):
+        """公告提供额外 CVE 不会使已提交的规范 GHSA 变错。"""
+        e = {"vuln_ids": ["GHSA-DEMO-0001-0XSS"]}
+        adv = {"cve_id": "CVE-2026-0001", "ghsa_id": "GHSA-DEMO-0001-0XSS"}
         r = check_vuln_ids(e, adv)
-        assert r["status"] == "incorrect"
+        assert r["status"] == "correct"
         assert any(ref["source"] == "advisory" for ref in r["evidence_refs"])
 
-    def test_missing_ghsa_in_advisory(self):
-        e = {"vuln_ids": ["CVE-2026-DEMO-0001"]}
-        adv = {"cve_id": "CVE-2026-DEMO-0001", "ghsa_id": "GHSA-DEMO-0001-XSS"}
+    def test_cve_only_is_supported_when_report_id_carries_ghsa(self):
+        e = {"vuln_ids": ["CVE-2026-0001"]}
+        adv = {"cve_id": "CVE-2026-0001", "ghsa_id": "GHSA-DEMO-0001-0XSS"}
         r = check_vuln_ids(e, adv)
-        assert r["status"] == "uncertain"
+        assert r["status"] == "correct"
         assert any(ref["source"] == "advisory" for ref in r["evidence_refs"])
 
     def test_normal_match_with_advisory_refs(self):
-        e = {"vuln_ids": ["CVE-2026-DEMO-0001", "GHSA-DEMO-0001-XSS"]}
-        adv = {"cve_id": "CVE-2026-DEMO-0001", "ghsa_id": "GHSA-DEMO-0001-XSS"}
+        e = {"vuln_ids": ["CVE-2026-0001", "GHSA-DEMO-0001-0XSS"]}
+        adv = {"cve_id": "CVE-2026-0001", "ghsa_id": "GHSA-DEMO-0001-0XSS"}
         r = check_vuln_ids(e, adv)
         assert r["status"] == "correct"
         sources = {ref["source"] for ref in r["evidence_refs"]}
         assert sources == {"advisory"}
+
+    def test_duplicate_or_lowercase_id_is_incorrect(self):
+        adv = {"cve_id": "CVE-2026-0001"}
+        duplicate = check_vuln_ids({"vuln_ids": ["CVE-2026-0001", "CVE-2026-0001"]}, adv)
+        lowercase = check_vuln_ids({"vuln_ids": ["cve-2026-demo-0001"]}, adv)
+        assert duplicate["status"] == "incorrect"
+        assert lowercase["status"] == "incorrect"
 
 
 # ============================================================
@@ -509,6 +569,24 @@ class TestTraceRefs:
         assert r["status"] == "incorrect"
         assert len(r["evidence_refs"]) >= 1
 
+    def test_node_read_unavailable_is_uncertain(self, llm, manifest):
+        class TraceSourceUnavailable:
+            def checkout(self, _project, _commit):
+                return ToolResult("checkout", True, {"cwd": "fixture://repo"})
+
+            def read_file_lines(self, _cwd, _file, _start, _end):
+                return ToolResult(
+                    "read_file_lines", False, None,
+                    "read timed out", "timeout",
+                )
+
+        result = check_trace(
+            _base_entry(manifest["items"][0]), TraceSourceUnavailable(), llm,
+        )
+
+        assert result["status"] == "uncertain"
+        assert result["evidence_refs"] == []
+
 
 # ============================================================
 # TestBackwardsCompat
@@ -520,7 +598,7 @@ class TestBackwardsCompat:
     def test_check_all_fields_keys(self, tools, llm, manifest):
         item = manifest["items"][0]
         e = _base_entry(item)
-        e["vuln_ids"] = ["CVE-2026-DEMO-0001"]
+        e["vuln_ids"] = ["CVE-2026-0001"]
         out = check_all_fields(e, tools, llm)
         assert "verdict" in out
         assert "fields" in out
@@ -533,7 +611,7 @@ class TestBackwardsCompat:
     def test_verdict_correct_when_all_correct(self, tools, llm, manifest):
         item = manifest["items"][0]
         e = _base_entry(item)
-        e["vuln_ids"] = ["CVE-2026-DEMO-0001"]
+        e["vuln_ids"] = ["CVE-2026-0001"]
         e["vuln_title"] = "Blog Platform Stored DOM XSS via Comment Rich Text"
         e["vuln_category_l1"] = "XSS"
         e["vuln_category_l2"] = "Stored XSS"
@@ -560,7 +638,7 @@ class TestIntegrationWithI1Schema:
     def test_all_eight_fields_validate(self, tools, llm, manifest):
         item = manifest["items"][0]
         e = _base_entry(item)
-        e["vuln_ids"] = ["CVE-2026-DEMO-0001"]
+        e["vuln_ids"] = ["CVE-2026-0001"]
         e["vuln_title"] = "Blog Platform Stored DOM XSS"
         e["vuln_category_l1"] = "XSS"
         e["vuln_category_l2"] = "Stored XSS"
@@ -587,90 +665,72 @@ class TestIntegrationWithI1Schema:
 # TestCommitLayer3 — I3 commit 三层判定（含 layer 3 公告范围）
 # ============================================================
 
+class _TaggedTools:
+    """只暴露 I3 所需的可定位本地 git 证据。"""
+
+    def __init__(self, tags=None, checkout_ok=True):
+        self.tags = list(tags or [])
+        self.checkout_ok = checkout_ok
+
+    def checkout(self, _project, commit):
+        data = {"cwd": "git://repo/" + commit} if self.checkout_ok else None
+        return ToolResult("checkout", self.checkout_ok, data, None if self.checkout_ok else "clone unavailable")
+
+    def git_log(self, _project, commit, limit=1):
+        return ToolResult("git_log", True, [{"sha": commit, "message": "fixture"}][:limit])
+
+    def git_tags_at_commit(self, _project, _commit):
+        return ToolResult("git_tags_at_commit", True, self.tags)
+
+
 class TestCommitLayer3:
-    """I3 启动手册 §5 验收 2-3：commit 与公告受影响版本范围相容 + role 区分。"""
+    """commit 校验区分源码快照引用与发布版本受影响范围。"""
 
-    def test_role_vulnerable_version_in_affected_range_correct(
-        self, tools_with_manifest, manifest,
-    ):
-        """role=vulnerable 且项目版本在公告 affected_versions 范围内 → correct。"""
-        item = next(it for it in manifest["items"] if it["role"] == "vulnerable")
-        e = _base_entry(item)
-        # 找一个真实公告：blog 的 affected_versions=[< 1.4.2]，version=v0.1.4 在范围内
-        adv = {"affected_versions": ["< 1.4.2"], "fixed_in": "1.4.2"}
-        r = check_commit(e, tools_with_manifest, advisory=adv)
-        assert r["status"] == "correct"
-        assert "漏洞引入" in r["evidence"] or "在 affected_versions" in r["evidence"]
-        assert len(r["evidence_refs"]) >= 2  # repo + git
-
-    def test_role_fixed_version_below_fixed_in_returns_uncertain(
-        self, tools_with_manifest, manifest,
-    ):
-        """role=fixed 但项目版本 < 公告 fixed_in → uncertain（不能把修复当引入）。"""
-        item = next(it for it in manifest["items"] if it["role"] == "fixed")
-        e = _base_entry(item)
-        # auth-svc 真实版本 v0.1.4, fixed_in=3.1.0 → 不应判为修复 commit
-        adv = {"affected_versions": ["< 3.1.0"], "fixed_in": "3.1.0"}
-        r = check_commit(e, tools_with_manifest, advisory=adv)
-        assert r["status"] == "uncertain"
-        assert "fixed" in r["evidence"] and "fixed_in" in r["evidence"]
-        # 仍保留 repo + git 引用
-        assert len(r["evidence_refs"]) >= 2
-
-    def test_role_fixed_version_meets_fixed_in_returns_correct(
-        self, tools_with_manifest, manifest,
-    ):
-        """role=fixed 且项目版本 >= 公告 fixed_in → correct。"""
-        item = next(it for it in manifest["items"] if it["role"] == "fixed")
-        e = _base_entry(item)
-        # 模拟 manifest 实际版本高于 fixed_in 的情况（重写 manifest_item 的 version 字段）
-        # 通过传入 advisory 且 fixed_in 设为很小值
-        adv = {"affected_versions": ["< 3.1.0"], "fixed_in": "0.0.1"}
-        r = check_commit(e, tools_with_manifest, advisory=adv)
-        # v0.1.4 >= 0.0.1 → correct
-        assert r["status"] == "correct"
-        assert "修复版本" in r["evidence"]
-
-    def test_role_unknown_returns_uncertain(self, tools_with_manifest, manifest):
-        """role=unknown 无法判定语义角色 → uncertain。"""
-        # 动态注入一个 role=unknown 的 manifest item
-        adv_manifest = {"items": [dict(manifest["items"][0], role="unknown")]}
-        repo_cache = tools_with_manifest.repo_cache_dir
-        advisory_dir = tools_with_manifest.advisory_dir
-        tools = VulnGymTools(repo_cache, advisory_dir, manifest=adv_manifest)
+    def test_exact_tag_in_affected_range_is_correct(self, manifest):
         e = _base_entry(manifest["items"][0])
-        adv = {"affected_versions": ["< 1.4.2"], "fixed_in": "1.4.2"}
-        r = check_commit(e, tools, advisory=adv)
-        assert r["status"] == "uncertain"
-        assert "unknown" in r["evidence"].lower()
-
-    def test_no_advisory_falls_through_to_correct(self, tools_with_manifest, manifest):
-        """无 advisory → fall through 到 format+cache correct（保持向后兼容）。"""
-        item = manifest["items"][0]
-        e = _base_entry(item)
-        r = check_commit(e, tools_with_manifest, advisory=None)
+        r = check_commit(e, _TaggedTools(["v1.0.0"]), {"affected_versions": ["< 1.1.0"]})
         assert r["status"] == "correct"
-        assert len(r["evidence_refs"]) >= 2
 
-    def test_role_vulnerable_version_not_in_affected_returns_uncertain(
-        self, tools_with_manifest, manifest,
-    ):
-        """role=vulnerable 但项目版本不在公告范围内 → uncertain。"""
-        item = next(it for it in manifest["items"] if it["role"] == "vulnerable")
-        e = _base_entry(item)
-        # blog version=v0.1.4，但设 fixed_in=0.0.1 → affected_versions=[< 0.0.1]，
-        # v0.1.4 不在该范围内 → uncertain
-        adv = {"affected_versions": ["< 0.0.1"], "fixed_in": "0.0.1"}
-        r = check_commit(e, tools_with_manifest, advisory=adv)
-        assert r["status"] == "uncertain"
+    def test_exact_tag_outside_affected_range_is_incorrect(self, manifest):
+        e = _base_entry(manifest["items"][0])
+        r = check_commit(e, _TaggedTools(["v1.2.0"]), {"affected_versions": ["< 1.1.0"]})
+        assert r["status"] == "incorrect"
 
-    def test_advisory_without_range_info_falls_through(self, tools_with_manifest, manifest):
-        """advisory 存在但没有 affected_versions/fixed_in → fall through correct。"""
-        item = manifest["items"][0]
-        e = _base_entry(item)
-        adv = {"title": "Some Advisory"}  # 仅标题，无范围信息
-        r = check_commit(e, tools_with_manifest, advisory=adv)
+    def test_missing_advisory_range_is_correct(self, manifest):
+        e = _base_entry(manifest["items"][0])
+        r = check_commit(e, _TaggedTools(["v1.0.0"]), {"title": "no range"})
         assert r["status"] == "correct"
+        # 证据必须说明 commit 可读且未做版本范围交叉验证
+        assert "本地仓库中读取" in r["evidence"]
+
+    def test_missing_exact_tag_is_correct(self, manifest):
+        e = _base_entry(manifest["items"][0])
+        result = check_commit(e, _TaggedTools(), {"affected_versions": ["< 1.1.0"]})
+        assert result["status"] == "correct"
+        # 证据必须说明无精确 tag 但不影响源码快照引用正确性
+        assert "tag" in result["evidence"].lower()
+        assert "源码快照引用" in result["evidence"]
+
+    def test_unavailable_clone_is_uncertain(self, manifest):
+        e = _base_entry(manifest["items"][0])
+        assert check_commit(e, _TaggedTools(checkout_ok=False), {"affected_versions": ["< 1.1.0"]})["status"] == "uncertain"
+
+    def test_unparseable_tag_is_uncertain(self, manifest):
+        e = _base_entry(manifest["items"][0])
+        r = check_commit(e, _TaggedTools(["not-a-version"]), {"affected_versions": ["< 1.1.0"]})
+        assert r["status"] == "uncertain"
+        assert "tag" in r["evidence"].lower() or "版本" in r["evidence"]
+
+    def test_fixed_commit_is_not_treated_as_vulnerable_commit(self, manifest):
+        e = _base_entry(manifest["items"][0])
+        r = check_commit(e, _TaggedTools(["v1.0.0"]), {
+            "affected_versions": ["< 1.1.0"], "fixed_commit": e["commit"],
+        })
+        assert r["status"] == "incorrect"
+
+    def test_malformed_advisory_identifier_is_uncertain(self):
+        r = check_vuln_ids({"vuln_ids": ["CVE-2026-0001"]}, {"cve_id": "not-an-id"})
+        assert r["status"] == "uncertain"
 
 
 # ============================================================
@@ -714,6 +774,19 @@ class TestI4ContractFixes:
         r = check_category("l1", e, adv, BrokenLLM())
         assert r["status"] == "uncertain"
 
+    def test_llm_exception_returns_uncertain_without_exception_text(self):
+        """超时/HTTP 等 client 异常也必须形成无敏感细节的三态结果。"""
+
+        class RaisingLLM:
+            name = "RaisingLLM"
+
+            def chat(self, messages, *, temperature=0.0):
+                raise TimeoutError("Bearer super-secret-token-12345678 timed out")
+
+        r = check_vuln_title({"vuln_title": "X"}, {"title": "Y"}, RaisingLLM())
+        assert r["status"] == "uncertain"
+        assert "super-secret" not in r["evidence"]
+
     def test_trace_llm_failure_returns_uncertain(self, tools, manifest):
         """trace LLM 失败 → uncertain。"""
 
@@ -749,7 +822,7 @@ class TestI4ContractFixes:
         assert "[PROMPT_VERSION=vuln_title_judge@1]" in captured[0]
 
     def test_category_uses_versioned_prompt(self):
-        """category LLM 接收到的 prompt 包含 [PROMPT_VERSION=vuln_category_l1_judge@1]。"""
+        """category LLM 接收到 taxonomy-aware 的 v2 prompt。"""
         captured = []
 
         class CaptureLLM:
@@ -765,10 +838,23 @@ class TestI4ContractFixes:
         e = {"vuln_category_l1": "X"}
         adv = {"vuln_category_l1_hint": "X"}
         check_category("l1", e, adv, CaptureLLM())
-        assert "[PROMPT_VERSION=vuln_category_l1_judge@1]" in captured[0]
+        assert "[PROMPT_VERSION=vuln_category_l1_judge@2]" in captured[0]
+        assert "taxonomy_version: 1.0.0" in captured[0]
+        assert "taxonomy_allowed_l1_l2_pairs:" in captured[0]
+        assert "xss: l1=[XSS" in captured[0]
 
-    def test_trace_uses_versioned_prompt(self, tools, manifest):
-        """trace LLM 接收到的 prompt 包含 [PROMPT_VERSION=trace_overall_judge@1]。"""
+    def test_l2_canonical_mismatch_is_deterministically_incorrect(self):
+        """l2 不能因同一个 l1 而被错误地映射成相同类别。"""
+        r = check_category(
+            "l2",
+            {"vuln_category_l1": "XSS", "vuln_category_l2": "Stored XSS"},
+            {"vuln_category_l2_hint": "服务端请求伪造"},
+            ScriptedMockLLMClient(),
+        )
+        assert r["status"] == "incorrect"
+
+    def test_trace_uses_versioned_prompt_and_trace_content(self, tools, manifest):
+        """trace 语义判断必须收到版本化提示词及实际链路内容。"""
         captured = []
 
         class CaptureLLM:
@@ -785,8 +871,10 @@ class TestI4ContractFixes:
         e = _base_entry(item)
         check_trace(e, tools, CaptureLLM())
         assert any(
-            "[PROMPT_VERSION=trace_overall_judge@1]" in m for m in captured
-        ), f"trace prompt should contain version prefix, got: {captured}"
+            "[PROMPT_VERSION=trace_overall_judge@2]" in m
+            and e["trace"][0]["code"] in m
+            for m in captured
+        ), f"trace prompt should contain version prefix and nodes, got: {captured}"
 
     def test_evidence_redacted_at_call_site(self, llm):
         """parse_structured_response 在调用点生效：含路径的 evidence 会被脱敏。"""
@@ -875,3 +963,204 @@ class TestVersionHelpers:
         from vulngym_verify_demo.field_checkers import _version_is_affected
         assert _version_is_affected("1.0.0", []) is None
         assert _version_is_affected("1.0.0", None) is None
+
+
+# ============================================================
+# TestSemanticBundle — title/L1/L2/trace 合并为一次 LLM 调用（P1-A）
+# ============================================================
+
+
+class TestSemanticBundle:
+    """semantic-bundle 契约：四字段合并为一次 LLM 调用，失败安全降级。"""
+
+    def test_bundle_accepts_facts_kwarg(self):
+        """check_semantic_bundle 必须接受 facts= 关键字参数。
+
+        回归测试：真实运行时 check_all_fields 调用写成了 advisory=facts，
+        而函数签名是 facts=，导致 TypeError 使整条 entry 降级为 agent-level
+        fallback（20 条全 uncertain）。
+        """
+        # 构造一个所有语义字段都能确定性判定的 entry，避免实际 LLM 调用
+        entry = {
+            "vuln_title": "Same Title",
+            "vuln_category_l1": "XSS",
+            "vuln_category_l2": "Stored XSS",
+            "trace": [],
+        }
+        facts = {"title": "Same Title", "valid": True}
+
+        class NoopLLM:
+            name = "NoopLLM"
+            def chat(self, messages, *, temperature=0.0):
+                raise AssertionError("should not call LLM when all fields deterministically decided")
+
+        # 关键：用 facts= 调用，不能 TypeError
+        results = check_semantic_bundle(entry, None, NoopLLM(), facts=facts)
+        assert isinstance(results, dict)
+
+    def test_bundle_makes_only_one_llm_call(self):
+        """title/L1/L2/trace 合并为一次 LLM 调用，而非四次独立调用。"""
+        call_count = {"n": 0}
+
+        class CountingLLM:
+            name = "CountingLLM"
+            def chat(self, messages, *, temperature=0.0):
+                call_count["n"] += 1
+                return json.dumps({
+                    "vuln_title": {"status": "correct", "confidence": 0.9, "evidence": "ok"},
+                    "vuln_category_l1": {"status": "correct", "confidence": 0.8, "evidence": "ok"},
+                    "vuln_category_l2": {"status": "incorrect", "confidence": 0.7, "evidence": "mismatch"},
+                    "trace": {"status": "uncertain", "confidence": 0.3, "evidence": "insufficient"},
+                })
+
+        # 构造需要 LLM 判断的 entry（title 不匹配、category 需要判断、trace 非空）
+        entry = {
+            "commit": "abc1234def567890abc1234def567890abc1234",
+            "vuln_title": "Different Title",
+            "vuln_category_l1": "XSS",
+            "vuln_category_l2": "Stored XSS",
+            "trace": [{"file": "a.js", "line": 1, "code": "x()"}],
+            "entry_point": {"file": "a.js", "line": 1, "code": "x()"},
+            "critical_operation": {"file": "a.js", "line": 2, "code": "y()"},
+        }
+        facts = {"title": "Other Title", "valid": True}
+
+        # 需要真实 tools 来做 trace 确定性前置检查；用 mock tools
+        from vulngym_verify_demo.tools import ToolResult
+
+        class FakeTools:
+            def read_file_lines(self, cwd, file, start, end):
+                return ToolResult("read_file_lines", True, {"lines": ["x()"], "snippet": "x()"}, None, None)
+            def checkout(self, project, commit):
+                return ToolResult("checkout", True, {"cwd": "/tmp/repo", "dir": "/tmp/repo"}, None, None)
+
+        results = check_semantic_bundle(entry, FakeTools(), CountingLLM(), facts=facts)
+        assert call_count["n"] == 1, f"expected exactly 1 LLM call, got {call_count['n']}"
+
+    def test_bundle_failure_downgrades_to_uncertain(self):
+        """bundle LLM 调用失败/非法输出 → 所有 bundle 字段降为 uncertain。"""
+        class BrokenLLM:
+            name = "BrokenLLM"
+            def chat(self, messages, *, temperature=0.0):
+                return "not json at all"
+
+        entry = {
+            "commit": "abc1234def567890abc1234def567890abc1234",
+            "vuln_title": "X",
+            "vuln_category_l1": "XSS",
+            "vuln_category_l2": "Stored XSS",
+            "trace": [{"file": "a.js", "line": 1, "code": "x()"}],
+            "entry_point": {"file": "a.js", "line": 1, "code": "x()"},
+            "critical_operation": {"file": "a.js", "line": 2, "code": "y()"},
+        }
+        facts = {
+            "summary": "Advisory Title Y",
+            "category_signal": {"l1_hint": "Injection", "l2_hint": "Command Injection"},
+            "valid": True,
+        }
+
+        from vulngym_verify_demo.tools import ToolResult
+
+        class FakeTools:
+            def read_file_lines(self, cwd, file, start, end):
+                return ToolResult("read_file_lines", True, {"lines": ["x()"], "snippet": "x()"}, None, None)
+            def checkout(self, project, commit):
+                return ToolResult("checkout", True, {"cwd": "/tmp/repo", "dir": "/tmp/repo"}, None, None)
+
+        results = check_semantic_bundle(entry, FakeTools(), BrokenLLM(), facts=facts)
+        # 进入 bundle 的字段都应降为 uncertain（title/l1/l2 一定进入，trace 可能被确定性判定）
+        bundle_fields_seen = [f for f in BUNDLE_FIELDS if f in results]
+        assert len(bundle_fields_seen) >= 3, f"expected at least 3 bundle fields, got {bundle_fields_seen}"
+        for field in bundle_fields_seen:
+            assert results[field]["status"] == "uncertain", (
+                f"{field} should be uncertain after bundle failure, got {results[field]['status']}"
+            )
+            ev_lower = results[field]["evidence"].lower()
+            assert "bundle" in ev_lower or "missing" in ev_lower or "semantic" in ev_lower, (
+                f"{field} evidence should mention bundle failure: {results[field]['evidence']}"
+            )
+
+    def test_bundle_success_parses_all_four_fields(self):
+        """bundle 成功返回时，四字段结果都被正确解析。"""
+        class GoodLLM:
+            name = "GoodLLM"
+            def chat(self, messages, *, temperature=0.0):
+                return json.dumps({
+                    "vuln_title": {"status": "incorrect", "confidence": 0.85, "evidence": "title mismatch"},
+                    "vuln_category_l1": {"status": "correct", "confidence": 0.9, "evidence": "l1 ok"},
+                    "vuln_category_l2": {"status": "uncertain", "confidence": 0.4, "evidence": "l2 unclear"},
+                    "trace": {"status": "correct", "confidence": 0.7, "evidence": "trace consistent"},
+                })
+
+        entry = {
+            "commit": "abc1234def567890abc1234def567890abc1234",
+            "vuln_title": "X", "vuln_category_l1": "XSS", "vuln_category_l2": "Stored XSS",
+            "trace": [{"file": "a.js", "line": 1, "code": "x()"}],
+            "entry_point": {"file": "a.js", "line": 1, "code": "x()"},
+            "critical_operation": {"file": "a.js", "line": 2, "code": "y()"},
+        }
+        facts = {
+            "summary": "Advisory Title Y",
+            "category_signal": {"l1_hint": "Injection", "l2_hint": "Command Injection"},
+            "valid": True,
+        }
+
+        from vulngym_verify_demo.tools import ToolResult
+
+        class FakeTools:
+            def read_file_lines(self, cwd, file, start, end):
+                return ToolResult("read_file_lines", True, {"lines": ["x()"], "snippet": "x()"}, None, None)
+            def checkout(self, project, commit):
+                return ToolResult("checkout", True, {"cwd": "/tmp/repo", "dir": "/tmp/repo"}, None, None)
+
+        results = check_semantic_bundle(entry, FakeTools(), GoodLLM(), facts=facts)
+        # title/l1/l2 一定进入 bundle 并被 GoodLLM 解析；trace 可能被确定性判定
+        assert results["vuln_title"]["status"] == "incorrect"
+        assert results["vuln_category_l1"]["status"] == "correct"
+        assert results["vuln_category_l2"]["status"] == "uncertain"
+        if "trace" in results:
+            assert results["trace"]["status"] in ("correct", "incorrect", "uncertain")
+        # confidence 被 clamp 到 [0, 1]
+        for field in BUNDLE_FIELDS:
+            if field in results:
+                assert 0.0 <= results[field]["confidence"] <= 1.0
+
+    def test_bundle_fields_are_exactly_four(self):
+        """BUNDLE_FIELDS 必须恰好是 title/L1/L2/trace 四个语义字段。"""
+        assert set(BUNDLE_FIELDS) == {"vuln_title", "vuln_category_l1", "vuln_category_l2", "trace"}
+        assert len(BUNDLE_FIELDS) == 4
+
+    def test_check_all_fields_uses_bundle_not_individual_calls(self, tools, manifest):
+        """check_all_fields 必须走 bundle 路径，语义字段只触发一次 LLM 调用。"""
+        call_count = {"n": 0}
+
+        class CountingLLM:
+            name = "CountingLLM"
+            def chat(self, messages, *, temperature=0.0):
+                call_count["n"] += 1
+                # self-check 也会调用 LLM，所以这里返回 agree=True
+                if "self_check" in messages[0].content or "agree" in messages[0].content:
+                    return json.dumps({"agree": True, "comment": "ok"})
+                return json.dumps({
+                    "vuln_title": {"status": "correct", "confidence": 0.9, "evidence": "ok"},
+                    "vuln_category_l1": {"status": "correct", "confidence": 0.8, "evidence": "ok"},
+                    "vuln_category_l2": {"status": "correct", "confidence": 0.8, "evidence": "ok"},
+                    "trace": {"status": "correct", "confidence": 0.7, "evidence": "ok"},
+                })
+
+        item = manifest["items"][0]
+        entry = _base_entry(item)
+        entry["vuln_title"] = "Different from advisory"
+        entry["vuln_ids"] = ["CVE-2026-0001"]
+
+        result = check_all_fields(entry, tools, CountingLLM())
+        # 语义字段 bundle 1 次 + self-check 1 次 = 最多 2 次 LLM 调用
+        # （旧的四字段独立调用会是 4 + 1 = 5 次）
+        assert call_count["n"] <= 2, (
+            f"expected <=2 LLM calls (bundle + self-check), got {call_count['n']}"
+        )
+        # 确定性字段不受 bundle 影响
+        assert "entry_point" in result["fields"]
+        assert "critical_operation" in result["fields"]
+        assert "commit" in result["fields"]
+        assert "vuln_ids" in result["fields"]

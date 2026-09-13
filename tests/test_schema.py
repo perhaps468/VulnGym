@@ -58,6 +58,7 @@ from vulngym_verify_demo import (  # noqa: E402
 from vulngym_verify_demo.schema import (  # noqa: E402
     FORBIDDEN_INTERNAL_FIELDS,
     REPORT_REQUIRED_TOP_FIELDS,
+    REPORT_AUDIT_FIELDS,
     STATUS_VALUES,
     TOOL_NAMES,
     VERDICT_VALUES,
@@ -315,23 +316,25 @@ class TestEntryValidation:
         errors = validate_entry(e)
         assert any("verify" in err for err in errors)
 
-    def test_verify_not_0_or_1(self):
+    def test_source_link_ghsa_must_match_report_id(self):
+        e = _minimal_valid_entry()
+        e["source_link"] = "https://github.com/advisories/GHSA-AAAA-BBBB-CCCC"
+
+        errors = validate_entry(e)
+
+        assert any("source_link" in err and "report_id" in err for err in errors)
+
+    def test_verify_value_outside_zero_or_one_is_rejected(self):
         e = _minimal_valid_entry()
         e["verify"] = 2
-        errors = validate_entry(e)
-        assert any("verify" in err for err in errors)
+        assert any("verify" in err for err in validate_entry(e))
 
     def test_verify_bool_rejected(self):
         """True/False 是 int 子类，但不是合法的 verify 值（必须是 0 或 1）。"""
         e = _minimal_valid_entry()
         e["verify"] = True
         errors = validate_entry(e)
-        # True == 1, so this would pass leniency check; verify the actual behavior
-        # Either it passes (1 == True) or fails (bool rejected). The contract says
-        # "must be 0 or 1", and True == 1, so this is a defensive case. We just
-        # look at behavior.
-        # If accepted, the result should be empty
-        assert errors == [] or any("verify" in err for err in errors)
+        assert any("verify" in err for err in errors)
 
     def test_bad_commit_format_uppercase(self):
         e = _minimal_valid_entry()
@@ -547,6 +550,18 @@ class TestFieldResultValidation:
         errors = validate_field_result(f, "entry_point")
         assert any("evidence" in e for e in errors)
 
+    def test_correct_field_requires_traceable_evidence_ref(self):
+        f = {
+            "status": "correct",
+            "confidence": 0.99,
+            "evidence": "model says this looks correct",
+            "evidence_refs": [],
+        }
+
+        errors = validate_field_result(f, "entry_point")
+
+        assert any("evidence_refs" in e and "correct" in e for e in errors)
+
     def test_evidence_refs_with_bad_ref(self):
         f = {
             "status": "uncertain",
@@ -705,6 +720,19 @@ class TestToolCallValidation:
         errors = validate_tool_call(call)
         assert any("error" in e for e in errors)
 
+    def test_failed_tool_call_requires_structured_error_code(self):
+        call = {
+            "seq": 1,
+            "tool": "read_advisory",
+            "ok": False,
+            "error": "advisory unavailable",
+            "evidence_refs": [],
+        }
+
+        errors = validate_tool_call(call)
+
+        assert any("error_code" in e for e in errors)
+
     def test_evidence_refs_must_be_list_of_strings(self):
         call = {
             "seq": 1,
@@ -723,17 +751,31 @@ class TestReportValidation:
     def test_valid_report(self):
         assert validate_report(_minimal_valid_report()) == []
 
-    def test_missing_top_level_field(self):
+    def test_missing_minimal_top_level_field(self):
         r = _minimal_valid_report()
-        del r["tool_trace"]
+        del r["summary"]
         errors = validate_report(r)
-        assert any("tool_trace" in e for e in errors)
+        assert any("summary" in e for e in errors)
+
+    def test_minimal_report_without_audit_extensions_is_valid(self):
+        r = _minimal_valid_report()
+        for field_name in REPORT_AUDIT_FIELDS:
+            del r[field_name]
+        assert validate_report(r) == []
 
     def test_bad_verdict(self):
         r = _minimal_valid_report()
         r["verdict"] = "maybe"
         errors = validate_report(r)
         assert any("verdict" in e for e in errors)
+
+    def test_verdict_must_be_derived_from_field_statuses(self):
+        r = _minimal_valid_report()
+        r["verdict"] = "correct"
+
+        errors = validate_report(r)
+
+        assert any("verdict" in e and "derived" in e for e in errors)
 
     def test_missing_one_of_eight_fields(self):
         r = _minimal_valid_report()
@@ -964,16 +1006,19 @@ class TestJsonRoundTrip:
         tc = ToolCall(
             seq=1,
             tool="read_advisory",
-            ok=True,
+            ok=False,
             input={"report_id": "GHSA-X"},
+            error="advisory not found",
+            error_code="advisory_not_found",
             evidence_refs=["fields.vuln_ids.evidence"],
         )
         d = json.loads(json.dumps(tc.to_dict()))
         tc2 = ToolCall.from_dict(d)
         assert tc2.seq == 1
         assert tc2.tool == "read_advisory"
-        assert tc2.ok is True
+        assert tc2.ok is False
         assert tc2.input == {"report_id": "GHSA-X"}
+        assert tc2.error_code == "advisory_not_found"
         assert tc2.evidence_refs == ["fields.vuln_ids.evidence"]
 
     def test_self_check_roundtrip(self):
@@ -1086,7 +1131,8 @@ class TestReportSchemaFile:
         with open(schema_path, "r", encoding="utf-8") as f:
             schema = json.load(f)
         fr_required = set(schema["definitions"]["FieldResult"]["required"])
-        assert {"status", "confidence", "evidence", "evidence_refs"} <= fr_required
+        assert {"status", "confidence", "evidence"} <= fr_required
+        assert "evidence_refs" not in fr_required
 
     def test_schema_status_enum(self):
         schema_path = _REPO_ROOT / "vulngym-verify-demo" / "vulngym_verify_demo" / "report_schema.json"
@@ -1226,7 +1272,7 @@ class TestSchemaMdInvariants:
             e = _minimal_valid_entry()
             e["verify"] = v
             assert validate_entry(e) == []
-        for v in [-1, 2, "0", "1", 1.0]:
+        for v in [2, -1, "0", "1", 1.0, True, False]:
             e = _minimal_valid_entry()
             e["verify"] = v
             errors = validate_entry(e)

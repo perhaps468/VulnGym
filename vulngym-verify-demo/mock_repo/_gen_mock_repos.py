@@ -92,4 +92,30 @@ write_lines(
     [(156, 'if (user.role !== requiredRole) throw new Forbidden();')],
 )
 
+# ===== remaining public smoke entries: each keeps local source evidence =====
+write_lines('user-api/5555555555555555555555555555555555555555/src/routes/user.js',
+            [(12, 'getUserById(req.params.id);')])
+write_lines('user-api/5555555555555555555555555555555555555555/src/user.js',
+            [(85, 'const sql = buildQuery(id);'), (88, 'db.query(sql);')])
+write_lines('code-sandbox/6666666666666666666666666666666666666666/src/api/execute.js',
+            [(45, 'runCode(req.body.code);')])
+write_lines('code-sandbox/6666666666666666666666666666666666666666/src/sandbox.js',
+            [(120, 'eval(userCode);')])
+write_lines('file-mgr/7777777777777777777777777777777777777777/src/routes/file.js',
+            [(23, 'deleteFile(req.query.path);')])
+write_lines('file-mgr/7777777777777777777777777777777777777777/src/cleanup.js',
+            [(63, 'const filePath = buildPath(path);'), (66, 'fs.unlinkSync(filePath);')])
+write_lines('oauth-provider/8888888888888888888888888888888888888888/src/routes/auth.js',
+            [(77, 'handleCallback(req.query.redirect_uri);')])
+write_lines('oauth-provider/8888888888888888888888888888888888888888/src/oauth.js',
+            [(155, 'redirect(url);')])
+write_lines('native-parser/9999999999999999999999999999999999999999/src/parser.js',
+            [(18, 'parseData(req.body);'), (22, 'callNative(data);')])
+write_lines('native-parser/9999999999999999999999999999999999999999/native/parser.c',
+            [(234, 'memcpy(buf, input, len);')])
+write_lines('token-api/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/src/middleware/auth.js',
+            [(34, 'authenticate(req);')])
+write_lines('token-api/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/src/auth.js',
+            [(99, "res.setHeader('X-Token', token);")])
+
 print('DONE')

@@ -1,7 +1,7 @@
 {
   "report_id": "GHSA-DEMO-0004-AUTH",
   "ghsa_id": "GHSA-DEMO-0004-AUTH",
-  "cve_id": "CVE-2026-DEMO-0004",
+  "cve_id": "CVE-2026-0004",
   "title": "Auth Service Authorization Bypass via Role Comparison",
   "severity": "high",
   "cvss": 7.5,

@@ -71,6 +71,19 @@ def test_iter_jsonl_empty_lines():
         assert results[1]["report_id"] == "b"
 
 
+def test_iter_jsonl_records_preserves_physical_line_numbers():
+    """新流式迭代器为 schema 错误保留原始 JSONL 行号。"""
+    from vulngym_verify_demo.cli import iter_jsonl_records
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        entries = Path(tmpdir) / "numbered.jsonl"
+        entries.write_text("\n{bad json}\n{}\n", encoding="utf-8")
+        stats = {}
+        records = list(iter_jsonl_records(entries, stats))
+        assert [(line_no, error is not None) for line_no, _, error in records] == [(2, True), (3, False)]
+        assert stats["blank_lines"] == 1
+
+
 # ============================================================
 # expand_path 单元测试
 # ============================================================
@@ -273,6 +286,132 @@ def test_cli_success_exit_code():
             "--llm", "mock"
         ])
         assert exit_code == 0
+
+
+def _valid_cli_entry() -> dict:
+    return {
+        "entry_id": "entry-cli-valid",
+        "report_id": "GHSA-DEMO-0001-0XSS",
+        "source_link": "https://github.com/advisories/GHSA-DEMO-0001-0XSS",
+        "vuln_ids": ["CVE-2026-0001", "GHSA-DEMO-0001-0XSS"],
+        "origin": "GitHub Advisory Database (reviewed)",
+        "project": "blog-platform",
+        "repo_url": "https://github.com/example/blog-platform",
+        "commit": "1111111111111111111111111111111111111111",
+        "vuln_title": "Blog Platform Stored DOM XSS via Comment Rich Text",
+        "vuln_category_l1": "XSS",
+        "vuln_category_l2": "Stored XSS",
+        "entry_point": {"file": "src/handlers/comment.js", "line": 97, "code": "insertTextHandler(data.content);"},
+        "critical_operation": {"file": "src/lib/RichTextInput.svelte", "line": 348, "code": "tempDiv.innerHTML = htmlContent;"},
+        "trace": [],
+        "verify": 1,
+    }
+
+
+def test_cli_streams_bad_json_and_schema_violation_then_continues(tmp_path):
+    """坏 JSON、schema 不合法、合法行均各输出一条，且 ID 使用物理行号。"""
+    from vulngym_verify_demo.cli import main
+
+    root = Path(__file__).resolve().parent.parent / "vulngym-verify-demo"
+    entries_path = tmp_path / "mixed.jsonl"
+    entries_path.write_text(
+        json.dumps(_valid_cli_entry(), ensure_ascii=False) + "\n"
+        "{bad json}\n"
+        + json.dumps({"entry_id": "bad-schema"}) + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "reports.jsonl"
+    code = main([
+        "--entries", str(entries_path),
+        "--repo-cache", str(root / "mock_repo"),
+        "--advisories", str(root / "mock_advisories"),
+        "--out", str(out_path),
+        "--llm", "mock",
+    ])
+    assert code == 0
+    reports = [json.loads(line) for line in out_path.read_text(encoding="utf-8").splitlines()]
+    assert [report["entry_id"] for report in reports] == [
+        "entry-cli-valid", "__invalid_input__:2", "__invalid_input__:3",
+    ]
+    assert reports[1]["input_error"]["kind"] == "json_parse_error"
+    assert reports[2]["input_error"]["kind"] == "missing_field"
+
+
+def test_cli_downgrades_invalid_agent_report_before_writing(tmp_path, monkeypatch):
+    import vulngym_verify_demo.cli as cli
+    from vulngym_verify_demo.schema import validate_report
+
+    root = Path(__file__).resolve().parent.parent / "vulngym-verify-demo"
+    entries_path = tmp_path / "entries.jsonl"
+    entries_path.write_text(
+        json.dumps(_valid_cli_entry(), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "reports.jsonl"
+    monkeypatch.setattr(cli, "verify_entry", lambda *_args, **_kwargs: {"verdict": "correct"})
+
+    code = cli.main([
+        "--entries", str(entries_path),
+        "--repo-cache", str(root / "mock_repo"),
+        "--advisories", str(root / "mock_advisories"),
+        "--out", str(out_path),
+        "--llm", "mock",
+    ])
+
+    assert code == 0
+    report = json.loads(out_path.read_text(encoding="utf-8"))
+    assert report["verdict"] == "uncertain"
+    assert report["report_error"]["kind"] == "invalid_report"
+    assert validate_report(report) == []
+
+
+def test_cli_schema_error_is_redacted_and_does_not_leak_path_or_key(tmp_path, capsys):
+    """错误报告与 CLI 日志都不输出输入行中的 credential/path。"""
+    from vulngym_verify_demo.cli import main
+
+    root = Path(__file__).resolve().parent.parent / "vulngym-verify-demo"
+    entries_path = tmp_path / "leaky.jsonl"
+    entry = _valid_cli_entry()
+    entry["repo_url"] = "C:\\Users\\private\\repo?api_key=short-test-key"
+    entries_path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    out_path = tmp_path / "reports.jsonl"
+    assert main([
+        "--entries", str(entries_path),
+        "--repo-cache", str(root / "mock_repo"),
+        "--advisories", str(root / "mock_advisories"),
+        "--out", str(out_path),
+        "--llm", "mock",
+    ]) == 0
+    rendered = out_path.read_text(encoding="utf-8") + capsys.readouterr().out
+    assert "short-test-key" not in rendered
+    assert "C:\\Users\\private" not in rendered
+
+
+def test_cli_missing_resource_directory_is_configuration_error(tmp_path):
+    from vulngym_verify_demo.cli import main
+
+    entries = tmp_path / "entries.jsonl"
+    entries.write_text("{}\n", encoding="utf-8")
+    assert main([
+        "--entries", str(entries),
+        "--repo-cache", str(tmp_path / "missing-repo-cache"),
+        "--advisories", str(tmp_path),
+        "--out", str(tmp_path / "out.jsonl"),
+    ]) == 2
+
+
+def test_cli_non_positive_timeout_is_configuration_error(tmp_path):
+    from vulngym_verify_demo.cli import main
+
+    entries = tmp_path / "entries.jsonl"
+    entries.write_text("{}\n", encoding="utf-8")
+    assert main([
+        "--entries", str(entries),
+        "--repo-cache", str(tmp_path),
+        "--advisories", str(tmp_path),
+        "--out", str(tmp_path / "out.jsonl"),
+        "--llm-timeout", "0",
+    ]) == 2
 
 
 # ============================================================

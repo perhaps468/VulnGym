@@ -1,266 +1,260 @@
 # -*- coding: utf-8 -*-
-"""金标对照与指标计算（字段级准确率、找错召回率）。
+"""Frozen offline evaluator for VulnGym's eight verification fields.
 
-gold.jsonl 格式（每行一条 entry 的金标）：
-    {
-      "entry_id":     "entry-00001",
-      "verdict":      "correct" | "incorrect" | "uncertain",
-      "incorrect_fields": ["critical_operation", ...]
-    }
+Core metric contract:
 
-约定：
-- `verdict = correct`  -> incorrect_fields 必须是 []
-- `verdict = incorrect` -> incorrect_fields 至少 1 个
-- `verdict = uncertain` -> incorrect_fields 必须是 []（表示该条整体不确定）
-
-指标：
-- 字段级准确率 = 各字段判定 status == gold 标记（correct/incorrect/uncertain）
-                命中数 / 总字段数
-- 找错召回率   = 实际找到的"含 incorrect 字段的 entry" / gold 中此类 entry 数
-                （漏判错误比误判正确更糟）
+* ``field_accuracy`` compares all eight gold statuses exactly. Missing reports,
+  missing fields and invalid statuses are prediction errors.
+* ``error_recall`` is entry-level: an entry with at least one gold
+  ``incorrect`` field is found only when its predicted ``verdict`` is
+  ``incorrect``. ``uncertain`` does not count as found.
+* Invalid-input fixtures and reports not represented in gold are excluded from
+  these core metrics and reported separately.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-ALL_FIELDS = (
-    "entry_point",          # 漏洞入口：第一次接收不可信数据的代码位置
-    "critical_operation",   # 关键危险操作：真正造成漏洞的 sink（如 innerHTML / exec）
-    "commit",               # 漏洞存在的 commit hash（VulnGym 在该 commit 上做白盒验证）
-    "vuln_ids",             # CVE / GHSA 等公开漏洞编号，用于公告交叉验证
-    "vuln_title",           # 漏洞标题，用于语义对齐公告描述
-    "vuln_category_l1",     # 漏洞大类（XSS / 注入 / 越权 …），按 VulnGym 分类体系
-    "vuln_category_l2",     # 漏洞子类（如 Stored XSS / 反射型），考核细粒度
-    "trace",                # 推理链路：从入口到危险操作的可追溯节点序列
+
+ALL_FIELDS: Tuple[str, ...] = (
+    "entry_point",
+    "critical_operation",
+    "commit",
+    "vuln_ids",
+    "vuln_title",
+    "vuln_category_l1",
+    "vuln_category_l2",
+    "trace",
 )
+STATUS_VALUES = frozenset({"correct", "incorrect", "uncertain"})
+VERDICT_VALUES = STATUS_VALUES
+INVALID_INPUT_PREFIX = "__invalid_input__"
 
 
-def load_gold(path: Path) -> Dict[str, Dict[str, Any]]:
-    """读 gold.jsonl -> {entry_id: gold_dict}
-    
-    支持两种格式：
-    1. 兼容格式：{"verdict": "...", "incorrect_fields": [...]}
-    2. 显式三态格式：{"verdict": "...", "fields": {"entry_point": "correct", ...}}
+def _is_invalid_fixture(entry_id: str) -> bool:
+    return entry_id.startswith(INVALID_INPUT_PREFIX)
+
+
+def _normalise_gold_row(row: Any, *, where: str) -> Dict[str, Any]:
+    """Validate one gold row and convert both supported formats to 8 statuses."""
+    if not isinstance(row, dict):
+        raise ValueError(f"{where}: gold row must be an object")
+    entry_id = row.get("entry_id")
+    verdict = row.get("verdict")
+    if not isinstance(entry_id, str) or not entry_id:
+        raise ValueError(f"{where}: entry_id must be a non-empty string")
+    if verdict not in VERDICT_VALUES:
+        raise ValueError(f"{where}: verdict must be one of {sorted(VERDICT_VALUES)}")
+
+    raw_incorrect = row.get("incorrect_fields", [])
+    if not isinstance(raw_incorrect, list) or not all(isinstance(name, str) for name in raw_incorrect):
+        raise ValueError(f"{where}: incorrect_fields must be a list of field names")
+    if len(set(raw_incorrect)) != len(raw_incorrect) or any(name not in ALL_FIELDS for name in raw_incorrect):
+        raise ValueError(f"{where}: incorrect_fields must be unique names from the eight core fields")
+
+    raw_fields = row.get("fields")
+    if raw_fields is not None:
+        if not isinstance(raw_fields, dict):
+            raise ValueError(f"{where}: fields must be an object")
+        missing = [name for name in ALL_FIELDS if name not in raw_fields]
+        invalid = [name for name in ALL_FIELDS if raw_fields.get(name) not in STATUS_VALUES]
+        if missing or invalid:
+            raise ValueError(f"{where}: explicit fields must provide valid statuses for all eight fields")
+        fields = {name: raw_fields[name] for name in ALL_FIELDS}
+        derived_incorrect = [name for name in ALL_FIELDS if fields[name] == "incorrect"]
+        if raw_incorrect and set(raw_incorrect) != set(derived_incorrect):
+            raise ValueError(f"{where}: incorrect_fields conflicts with explicit fields")
+        gold_format = "explicit"
+    else:
+        # Compatibility format has only a verdict plus incorrect field names.
+        # For an incorrect/uncertain entry, unspecified fields are intentionally
+        # ``uncertain`` rather than fabricated ``correct`` labels.
+        default = "correct" if verdict == "correct" else "uncertain"
+        fields = {name: ("incorrect" if name in raw_incorrect else default) for name in ALL_FIELDS}
+        derived_incorrect = list(raw_incorrect)
+        gold_format = "compat"
+
+    if verdict == "correct" and derived_incorrect:
+        raise ValueError(f"{where}: a correct verdict cannot have incorrect fields")
+    if verdict == "uncertain" and derived_incorrect:
+        raise ValueError(f"{where}: an uncertain verdict cannot have incorrect fields")
+    if verdict == "incorrect" and not derived_incorrect:
+        raise ValueError(f"{where}: an incorrect verdict needs at least one incorrect field")
+
+    return {
+        "entry_id": entry_id,
+        "verdict": verdict,
+        "fields": fields,
+        "incorrect_fields": derived_incorrect,
+        "format": gold_format,
+    }
+
+
+def load_gold(path: Path | str) -> Dict[str, Dict[str, Any]]:
+    """Load and validate explicit or compatible gold JSONL.
+
+    The returned mapping always contains a complete eight-field status map,
+    making the metric denominator stable and auditable.
     """
     gold: Dict[str, Dict[str, Any]] = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_no, raw in enumerate(handle, start=1):
+            text = raw.strip()
+            if not text:
                 continue
-            row = json.loads(line)
-            eid = row["entry_id"]
-            gold_entry = {"verdict": row["verdict"]}
-            
-            # 如果有显式三态 fields，保留它
-            if "fields" in row:
-                gold_entry["fields"] = row["fields"]
-            
-            # 如果有 incorrect_fields，保留它（兼容格式）
-            if "incorrect_fields" in row:
-                gold_entry["incorrect_fields"] = list(row.get("incorrect_fields", []) or [])
-            
-            gold[eid] = gold_entry
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"gold line {line_no}: invalid JSON") from exc
+            item = _normalise_gold_row(row, where=f"gold line {line_no}")
+            if item["entry_id"] in gold:
+                raise ValueError(f"gold line {line_no}: duplicate entry_id {item['entry_id']!r}")
+            gold[item["entry_id"]] = item
     return gold
 
 
-def evaluate(
-    reports: List[Dict[str, Any]],
-    gold: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    """对照 reports 与 gold 返回指标 dict。
+def _normalise_gold_mapping(gold: Mapping[str, Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Accept legacy in-memory mappings while applying the same validation."""
+    normalised: Dict[str, Dict[str, Any]] = {}
+    for map_key, item in gold.items():
+        row = dict(item)
+        row.setdefault("entry_id", map_key)
+        normalised[map_key] = _normalise_gold_row(row, where=f"gold entry {map_key!r}")
+    return normalised
 
-    字段级准确率定义（与考题“字段级准确率 ≥ 0.85”对齐）：
-    - 仅对 **gold 显式标注意见的字段** 计分。gold 中某字段出现在
-      `incorrect_fields` 里则金标为 incorrect；否则该字段的"是否给出可靠
-      判定"由 entry 的 verdict 推断：
-        * verdict=correct   -> 其他字段金标视为 correct
-        * verdict=incorrect -> 其他字段金标视为 uncertain（需要人工复核）
-        * verdict=uncertain -> 其他字段金标视为 uncertain
-    这样在金标只标了"哪个 entry 错哪个字段"时不会因为其他字段必然为
-    uncertain 而人为拉低准确率。
-    """
-    field_total = 0
-    field_hit = 0
-    field_breakdown: Dict[str, Dict[str, int]] = {
-        f: {"total": 0, "hit": 0} for f in ALL_FIELDS
-    }
-    error_total = 0
-    error_hit = 0
-    verdict_total = 0
-    verdict_hit = 0
+
+def _report_index(reports: Iterable[Mapping[str, Any]]) -> Tuple[Dict[str, Mapping[str, Any]], int]:
+    indexed: Dict[str, Mapping[str, Any]] = {}
+    duplicates = set()
+    for report in reports:
+        entry_id = report.get("entry_id") if isinstance(report, Mapping) else None
+        if not isinstance(entry_id, str):
+            continue
+        if entry_id in indexed:
+            duplicates.add(entry_id)
+        indexed[entry_id] = report
+    # A duplicate is not a trustworthy prediction. Remove it so it scores as a
+    # missing report if the entry exists in gold.
+    for entry_id in duplicates:
+        indexed.pop(entry_id, None)
+    return indexed, len(duplicates)
+
+
+def evaluate(reports: List[Dict[str, Any]], gold: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Evaluate reports under the frozen field-accuracy and recall definitions."""
+    normalised_gold = _normalise_gold_mapping(gold)
+    reports_map, duplicate_report_count = _report_index(reports)
+    field_hit = field_total = error_hit = error_total = verdict_hit = verdict_total = 0
+    field_breakdown: Dict[str, Dict[str, int]] = {name: {"hit": 0, "total": 0} for name in ALL_FIELDS}
     per_entry: List[Dict[str, Any]] = []
+    excluded_invalid_entries = 0
 
-    # 将 reports 转为 {entry_id: report} 映射
-    reports_map = {r["entry_id"]: r for r in reports}
-
-    for eid, g in gold.items():
-        r = reports_map.get(eid)
-        
-        # 缺失报告：所有字段计错
-        if not r:
-            for f in ALL_FIELDS:
-                field_total += 1
-                field_breakdown[f]["total"] += 1
-            # 如果 gold verdict 是 incorrect，计入错误召回分母
-            if g["verdict"] == "incorrect" or g.get("incorrect_fields"):
-                error_total += 1
-            verdict_total += 1
+    for entry_id, item in normalised_gold.items():
+        report = reports_map.get(entry_id)
+        if _is_invalid_fixture(entry_id):
+            excluded_invalid_entries += 1
             per_entry.append({
-                "entry_id": eid,
-                "verdict_pred": None,
-                "verdict_gold": g["verdict"],
+                "entry_id": entry_id,
+                "included": False,
+                "reason": "invalid_input_fixture",
+                "verdict_pred": report.get("verdict") if report else None,
+                "verdict_gold": item["verdict"],
                 "incorrect_pred": [],
-                "incorrect_gold": g.get("incorrect_fields", []),
+                "incorrect_gold": item["incorrect_fields"],
             })
             continue
-        
-        # 特殊处理 __invalid_input__ 样本
-        if eid.startswith("__invalid_input__"):
-            verdict_total += 1
-            if r.get("verdict") == "uncertain" and g["verdict"] == "uncertain":
-                verdict_hit += 1
-            per_entry.append({
-                "entry_id": eid,
-                "verdict_pred": r.get("verdict"),
-                "verdict_gold": g["verdict"],
-                "incorrect_pred": [],
-                "incorrect_gold": [],
-            })
-            continue
-        
-        # 检测 gold 格式：是否有显式三态 fields
-        has_explicit_fields = "fields" in g and isinstance(g["fields"], dict)
-        
-        if has_explicit_fields:
-            # 显式三态格式：逐字段比对
-            for f in ALL_FIELDS:
-                field_total += 1
-                field_breakdown[f]["total"] += 1
-                gold_status = g["fields"].get(f)
-                # 防御：如果 gold 缺少该字段，跳过（不计入统计）
-                if gold_status is None:
-                    field_total -= 1
-                    field_breakdown[f]["total"] -= 1
-                    continue
-                report_status = (r.get("fields", {}).get(f) or {}).get("status")
-                if report_status == gold_status:
-                    field_hit += 1
-                    field_breakdown[f]["hit"] += 1
-        else:
-            # 兼容格式：用 verdict 推断默认状态
-            if g["verdict"] == "correct":
-                default_field_status = "correct"
-            else:
-                default_field_status = "uncertain"
-            
-            for f in ALL_FIELDS:
-                field_total += 1
-                field_breakdown[f]["total"] += 1
-                actual_status = (r.get("fields", {}).get(f) or {}).get("status")
-                gold_flag = (
-                    "incorrect"
-                    if f in g.get("incorrect_fields", [])
-                    else default_field_status
-                )
-                if actual_status == gold_flag:
-                    field_hit += 1
-                    field_breakdown[f]["hit"] += 1
-        
-        # 找错召回：entry 含任何 incorrect 字段算"需要被找出"
-        needs_incorrect = bool(g.get("incorrect_fields", []))
+
+        verdict_total += 1
+        verdict_pred = report.get("verdict") if report else None
+        if verdict_pred == item["verdict"]:
+            verdict_hit += 1
+
+        fields_pred = report.get("fields") if isinstance(report, Mapping) else None
+        if not isinstance(fields_pred, Mapping):
+            fields_pred = {}
+        for name in ALL_FIELDS:
+            field_total += 1
+            field_breakdown[name]["total"] += 1
+            actual = fields_pred.get(name)
+            actual_status = actual.get("status") if isinstance(actual, Mapping) else None
+            if actual_status == item["fields"][name]:
+                field_hit += 1
+                field_breakdown[name]["hit"] += 1
+
+        needs_incorrect = bool(item["incorrect_fields"])
         if needs_incorrect:
             error_total += 1
-            found = any(
-                (r.get("fields", {}).get(f) or {}).get("status") == "incorrect"
-                for f in g["incorrect_fields"]
-            )
-            if found:
+            if verdict_pred == "incorrect":
                 error_hit += 1
-        
-        # 整体 verdict
-        verdict_total += 1
-        if r.get("verdict") == g["verdict"]:
-            verdict_hit += 1
-        
+
         per_entry.append({
-            "entry_id": eid,
-            "verdict_pred": r.get("verdict"),
-            "verdict_gold": g["verdict"],
+            "entry_id": entry_id,
+            "included": True,
+            "verdict_pred": verdict_pred,
+            "verdict_gold": item["verdict"],
             "incorrect_pred": [
-                f
-                for f, v in (r.get("fields") or {}).items()
-                if (v or {}).get("status") == "incorrect"
+                name for name, value in fields_pred.items()
+                if isinstance(value, Mapping) and value.get("status") == "incorrect"
             ],
-            "incorrect_gold": g.get("incorrect_fields", []),
+            "incorrect_gold": item["incorrect_fields"],
         })
 
+    unexpected_report_count = sum(
+        1 for entry_id in reports_map
+        if entry_id not in normalised_gold or _is_invalid_fixture(entry_id)
+    )
     metrics = {
         "n_entries": verdict_total,
-        "field_accuracy": (field_hit / field_total) if field_total else 0.0,
-        "error_recall": (error_hit / error_total) if error_total else 1.0,
-        "verdict_accuracy": (verdict_hit / verdict_total) if verdict_total else 1.0,
+        "field_accuracy": field_hit / field_total if field_total else 0.0,
+        "error_recall": error_hit / error_total if error_total else 1.0,
+        "verdict_accuracy": verdict_hit / verdict_total if verdict_total else 0.0,
         "field_total": field_total,
         "field_hit": field_hit,
         "error_total": error_total,
         "error_hit": error_hit,
         "verdict_total": verdict_total,
         "verdict_correct": verdict_hit,
+        "excluded_invalid_entries": excluded_invalid_entries,
+        "unexpected_report_count": unexpected_report_count,
+        "duplicate_report_count": duplicate_report_count,
         "per_entry": per_entry,
     }
     metrics["field_breakdown"] = {
-        f: {
-            "accuracy": (v["hit"] / v["total"]) if v["total"] else None,
-            "hit": v["hit"],
-            "total": v["total"],
+        name: {
+            "accuracy": values["hit"] / values["total"] if values["total"] else None,
+            "hit": values["hit"],
+            "total": values["total"],
         }
-        for f, v in field_breakdown.items()
+        for name, values in field_breakdown.items()
     }
     return metrics
 
 
-def format_metrics(m: Dict[str, Any]) -> str:
-    """格式化打印：阈值参照题目要求 (≥0.85 / ≥0.90)。"""
-    lines: List[str] = []
-    lines.append("=" * 72)
-    lines.append(f"VulnGym 字段级验证 — 评测 (n_entries={m['n_entries']})")
-    lines.append(
-        f"  field-level accuracy : {m['field_accuracy']:.3f}  "
-        f"({m['field_hit']}/{m['field_total']})  [target >= 0.85]"
-    )
-    lines.append(
-        f"  error recall         : {m['error_recall']:.3f}  "
-        f"({m['error_hit']}/{m['error_total']})  [target >= 0.90]"
-    )
-    lines.append(
-        f"  verdict accuracy     : {m['verdict_accuracy']:.3f}  "
-        f"({m['n_entries']} entries)"
-    )
+def format_metrics(metrics: Dict[str, Any]) -> str:
+    """Render the frozen metrics in a stable human-readable format."""
+    # ``verdict_total`` was added with the frozen metrics contract.  Retain
+    # compatibility with callers that only supplied the older ``n_entries``.
+    verdict_total = metrics.get("verdict_total", metrics["n_entries"])
+    lines = [
+        "=" * 72,
+        f"VulnGym 字段级验证 — 评测 (n_entries={metrics['n_entries']})",
+        f"  field-level accuracy : {metrics['field_accuracy']:.3f}  ({metrics['field_hit']}/{metrics['field_total']})  [target >= 0.85]",
+        f"  error recall         : {metrics['error_recall']:.3f}  ({metrics['error_hit']}/{metrics['error_total']})  [target >= 0.90]",
+        f"  verdict accuracy     : {metrics['verdict_accuracy']:.3f}  ({metrics['verdict_correct']}/{verdict_total})",
+        f"  excluded invalid     : {metrics.get('excluded_invalid_entries', 0)}",
+        f"  unexpected reports   : {metrics.get('unexpected_report_count', 0)}",
+        "-" * 72,
+        f"  {'field':<20s} {'accuracy':>10s} {'hit':>6s}/{'total':<6s}",
+    ]
+    for name in ALL_FIELDS:
+        breakdown = metrics["field_breakdown"][name]
+        accuracy = breakdown["accuracy"]
+        accuracy_text = f"{accuracy:.3f}" if accuracy is not None else "n/a"
+        lines.append(f"  {name:<20s} {accuracy_text:>10s} {breakdown['hit']:>6d}/{breakdown['total']:<6d}")
     lines.append("-" * 72)
-    lines.append(
-        f"  {'field':<20s} {'accuracy':>10s} {'hit':>6s}/{'total':<6s}"
-    )
-    for f, b in m["field_breakdown"].items():
-        acc = b["accuracy"]
-        acc_s = f"{acc:.3f}" if acc is not None else "  n/a"
-        lines.append(
-            f"  {f:<20s} {acc_s:>10s} {b['hit']:>6d}/{b['total']:<6d}"
-        )
-    lines.append("-" * 72)
-    lines.append("  note: low field accuracy is expected when running on a")
-    lines.append("        script-mock LLM that returns 'correct' for fields")
-    lines.append("        whose gold is 'uncertain' (e.g. commit/vuln_title/")
-    lines.append("        trace on the incorrect entries). On a real LLM,")
-    lines.append("        those fields degrade to uncertain, lifting accuracy.")
-    lines.append("-" * 72)
-    lines.append("  per-entry breakdown:")
-    for pe in m["per_entry"]:
-        lines.append(
-            f"    {pe['entry_id']}: verdict={pe['verdict_pred']:<10s} "
-            f"gold={pe['verdict_gold']:<10s} "
-            f"pred_inc={pe['incorrect_pred']} gold_inc={pe['incorrect_gold']}"
-        )
+    lines.append("  field accuracy requires exact gold-status matches for all eight fields.")
+    lines.append("  error recall counts only gold-error entries predicted with verdict=incorrect.")
     lines.append("=" * 72)
     return "\n".join(lines)

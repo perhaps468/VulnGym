@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
+from .tools import TOOL_ERROR_CODES  # 单一权威错误码枚举（避免两份枚举漂移）
+
 
 # ============================================================
 # SCHEMA.md 派生常量
@@ -67,13 +69,18 @@ FORBIDDEN_INTERNAL_FIELDS: frozenset = frozenset({
     "vuln_category_l3",
 })
 
-#: report 必填字段
+#: 题目最小报告必填字段。plan/self_check/tool_trace 是本实现的审计扩展，
+#: 因而不能阻止使用题目示例中的最小报告。
 REPORT_REQUIRED_TOP_FIELDS: Tuple[str, ...] = (
     "report_id",
     "entry_id",
     "verdict",
     "fields",
     "summary",
+)
+
+#: 可选审计字段；出现时必须符合各自的结构契约。
+REPORT_AUDIT_FIELDS: Tuple[str, ...] = (
     "self_check",
     "plan",
     "tool_trace",
@@ -113,6 +120,7 @@ TOOL_NAMES: frozenset = frozenset({
     "read_file_lines",
     "grep_code",
     "git_log",
+    "git_tags_at_commit",
 })
 
 #: commit 格式正则（40 位小写 hex）
@@ -246,6 +254,13 @@ def validate_entry(entry: Any) -> List[str]:
             f"entry.source_link: must start with {SOURCE_LINK_PREFIX!r}, "
             f"got {entry['source_link']!r}"
         )
+    else:
+        embedded_report_id = entry["source_link"][len(SOURCE_LINK_PREFIX):].rstrip("/")
+        report_id = entry.get("report_id")
+        if not isinstance(report_id, str) or embedded_report_id.upper() != report_id.upper():
+            errors.append(
+                "entry.source_link: embedded GHSA id must equal entry.report_id"
+            )
     if not isinstance(entry["vuln_ids"], list):
         errors.append("entry.vuln_ids: expected list of strings")
     else:
@@ -280,7 +295,9 @@ def validate_entry(entry: Any) -> List[str]:
 
     verify = entry.get("verify")
     if not isinstance(verify, int) or isinstance(verify, bool) or verify not in (0, 1):
-        errors.append(f"entry.verify: must be 0 or 1, got {verify!r}")
+        errors.append(
+            f"entry.verify: must be integer 0 or 1, got {verify!r}"
+        )
 
     # 节点校验
     errors.extend(validate_node(entry.get("entry_point"), where="entry_point"))
@@ -341,6 +358,10 @@ def validate_field_result(field_obj: Any, field_name: str) -> List[str]:
     if not isinstance(refs, list):
         errors.append(f"fields.{field_name}.evidence_refs: expected list")
     else:
+        if field_obj.get("status") == "correct" and not refs:
+            errors.append(
+                f"fields.{field_name}.evidence_refs: correct status requires at least one traceable reference"
+            )
         for i, r in enumerate(refs):
             ok, msg = validate_evidence_ref(r)
             if not ok:
@@ -367,6 +388,23 @@ def validate_tool_call(call: Any) -> List[str]:
         errors.append(f"tool_trace[?].ok: must be bool")
     if "error" in call and call["error"] is not None and not isinstance(call["error"], str):
         errors.append(f"tool_trace[?].error: must be string or null")
+    error_code = call.get("error_code")
+    if call.get("ok") is False:
+        # P0-3：失败调用必须同时携带非空 error 与枚举内 error_code，否则整条 trace
+        # 会失效（历史上 checkout 快照分支曾经 error_code=None）。
+        if not isinstance(call.get("error"), str) or not call["error"].strip():
+            errors.append("tool_trace[?].error: failed calls require a non-empty error message")
+        if error_code not in TOOL_ERROR_CODES:
+            errors.append(
+                "tool_trace[?].error_code: failed calls require one of "
+                f"{sorted(TOOL_ERROR_CODES)}, got {error_code!r}"
+            )
+    elif error_code is not None and error_code not in TOOL_ERROR_CODES:
+        errors.append(
+            f"tool_trace[?].error_code: unknown code {error_code!r}"
+        )
+    elif call.get("ok") is True and (error_code is not None or call.get("error") is not None):
+        errors.append("tool_trace[?]: successful calls must not carry error or error_code")
     refs = call.get("evidence_refs", [])
     if not isinstance(refs, list):
         errors.append(f"tool_trace[?].evidence_refs: expected list of JSON paths")
@@ -463,19 +501,38 @@ def validate_report(report: Any) -> List[str]:
     else:
         for fname in ALL_EIGHT_FIELDS:
             errors.extend(validate_field_result(fields_obj.get(fname), fname))
+        statuses = [
+            fields_obj.get(fname, {}).get("status")
+            for fname in ALL_EIGHT_FIELDS
+            if isinstance(fields_obj.get(fname), dict)
+        ]
+        if len(statuses) == len(ALL_EIGHT_FIELDS) and all(
+            status in STATUS_VALUES for status in statuses
+        ):
+            expected_verdict = (
+                "incorrect" if "incorrect" in statuses
+                else "correct" if all(status == "correct" for status in statuses)
+                else "uncertain"
+            )
+            if report.get("verdict") in VERDICT_VALUES and report["verdict"] != expected_verdict:
+                errors.append(
+                    "report.verdict: must be derived from field statuses; "
+                    f"expected {expected_verdict!r}, got {report['verdict']!r}"
+                )
 
-    # self_check / plan
-    errors.extend(validate_self_check(report.get("self_check")))
-    errors.extend(validate_plan(report.get("plan")))
-
-    # tool_trace
-    tt = report.get("tool_trace")
-    if not isinstance(tt, list):
-        errors.append("report.tool_trace: expected list")
-    else:
-        for i, call in enumerate(tt):
-            errs = validate_tool_call(call)
-            errors.extend(f"tool_trace[{i}].{e}" if not e.startswith("tool_trace[") else e for e in errs)
+    # 审计扩展均为可选；若存在则必须完整、可审计。
+    if "self_check" in report:
+        errors.extend(validate_self_check(report["self_check"]))
+    if "plan" in report:
+        errors.extend(validate_plan(report["plan"]))
+    if "tool_trace" in report:
+        tt = report["tool_trace"]
+        if not isinstance(tt, list):
+            errors.append("report.tool_trace: expected list")
+        else:
+            for i, call in enumerate(tt):
+                errs = validate_tool_call(call)
+                errors.extend(f"tool_trace[{i}].{e}" if not e.startswith("tool_trace[") else e for e in errs)
 
     # input_error（可选但若存在必须符合）
     if "input_error" in report:
@@ -552,6 +609,116 @@ def build_invalid_input_report(
             "message": message,
         },
     }
+
+
+def build_report_validation_failure(
+    entry: Any,
+    line_no: int,
+    errors: Iterable[str],
+    report: Any = None,
+) -> Dict[str, Any]:
+    """Repair an Agent report that failed its final gate **without discarding evidence**.
+
+    P0-3 requires that a single malformed ``tool_trace`` entry must not wipe the
+    whole audit trail.  Therefore this function now *salvages* every
+    independently-valid part of the incoming report:
+
+    * ``fields``      — keep valid field results, downgrade only the invalid ones
+    * ``self_check``  — keep when structurally valid
+    * ``plan``        — keep when structurally valid
+    * ``tool_trace``  — keep the valid calls, drop only the malformed ones
+
+    The result is always schema-valid, and a sanitized ``report_error`` records
+    exactly which parts were repaired.
+    """
+    source = entry if isinstance(entry, dict) else {}
+    incoming = report if isinstance(report, dict) else {}
+    fallback_id = invalid_input_id(line_no)
+    entry_id = source.get("entry_id") or incoming.get("entry_id")
+    report_id = source.get("report_id") or incoming.get("report_id")
+    error_list = [str(error) for error in errors]
+    safe_errors = _sanitize_message("; ".join(error_list))
+
+    # ---- fields：只降级不合法的字段，保留其它字段的真实结论 ----
+    incoming_fields = incoming.get("fields") if isinstance(incoming.get("fields"), dict) else {}
+    fields: Dict[str, Any] = {}
+    repaired_fields: List[str] = []
+    for name in ALL_EIGHT_FIELDS:
+        candidate = incoming_fields.get(name)
+        candidate_errors = validate_field_result(candidate, name) if candidate is not None else ["missing"]
+        if candidate is not None and not candidate_errors:
+            fields[name] = dict(candidate)
+        else:
+            repaired_fields.append(name)
+            fields[name] = {
+                "status": "uncertain",
+                "confidence": 0.0,
+                "evidence": (
+                    "field result failed final validation and was downgraded to uncertain: "
+                    f"{_sanitize_message('; '.join(candidate_errors))}"
+                ),
+                "evidence_refs": [],
+            }
+
+    # ---- tool_trace：保留合法调用，仅剔除结构非法的记录 ----
+    incoming_trace = incoming.get("tool_trace")
+    kept_trace: List[Any] = []
+    dropped_calls = 0
+    if isinstance(incoming_trace, list):
+        for call in incoming_trace:
+            if not validate_tool_call(call):
+                kept_trace.append(call)
+            else:
+                dropped_calls += 1
+
+    # ---- self_check / plan：合法则原样保留 ----
+    self_check = incoming.get("self_check")
+    if validate_self_check(self_check):
+        self_check = {
+            "status": "skipped",
+            "agree": False,
+            "comment": "self-check was discarded because it failed structural validation",
+            "checked_fields": [],
+        }
+    plan = incoming.get("plan")
+    if validate_plan(plan):
+        plan = {
+            "version": "1",
+            "tools_planned": [],
+            "fields_planned": list(ALL_EIGHT_FIELDS),
+        }
+
+    # ---- verdict 必须由保留下来的字段状态重新推导 ----
+    statuses = [fields[name]["status"] for name in ALL_EIGHT_FIELDS]
+    verdict = (
+        "incorrect" if "incorrect" in statuses
+        else "correct" if all(status == "correct" for status in statuses)
+        else "uncertain"
+    )
+
+    summary = (
+        "agent output failed final validation; repaired to a schema-valid report "
+        f"while preserving audit trail ({len(kept_trace)} tool calls kept, "
+        f"{dropped_calls} malformed calls dropped)"
+    )
+    repaired: Dict[str, Any] = {
+        "report_id": report_id if isinstance(report_id, str) and report_id else fallback_id,
+        "entry_id": entry_id if isinstance(entry_id, str) and entry_id else fallback_id,
+        "verdict": verdict,
+        "fields": fields,
+        "summary": summary,
+        "self_check": self_check,
+        "plan": plan,
+        "tool_trace": kept_trace,
+        "report_error": {
+            "line_no": line_no,
+            "kind": "invalid_report",
+            "message": safe_errors,
+            "repaired_fields": repaired_fields,
+            "dropped_tool_calls": dropped_calls,
+        },
+    }
+    return repaired
 
 
 # ============================================================

@@ -10,6 +10,7 @@
 - schema.py       I1：SCHEMA.md 输入校验、报告校验、坏输入报告协议（§4.1/§5 I1）
 - models.py       I1：VerificationReport dataclass + §4.2 向后兼容导出
 - report_schema.json  I1：唯一规范 JSON Schema（§4.1）
+- taxonomy.py      I1：版本化 12 类分类本体及历史标签规范化
 
 公共符号（I1 起从包根直接可用）：
 
@@ -32,7 +33,7 @@
 from __future__ import annotations
 
 # §4.2 向后兼容导出
-from .tools import VulnGymTools, ToolResult, normalize_project_from_repo
+from .tools import VulnGymTools, ToolResult, load_repo_catalog, normalize_project_from_repo
 from .llm_client import (
     BaseLLMClient,
     ResilientLLMClient,
@@ -74,6 +75,7 @@ from .schema import (
     FORBIDDEN_INTERNAL_FIELDS,
     ORIGIN_CONSTANT,
     REPORT_REQUIRED_TOP_FIELDS,
+    REPORT_AUDIT_FIELDS,
     SELF_CHECK_STATUS_VALUES,
     STATUS_VALUES,
     TOOL_NAMES,
@@ -94,6 +96,29 @@ from .schema import (
     validate_self_check,
     validate_tool_call,
 )
+from .taxonomy import (
+    CategoryTaxonomy,
+    TaxonomyCategory,
+    load_category_taxonomy,
+    validate_taxonomy_data,
+)
+
+# P0-2 / P0-4：T1Data 适配层（仓库解析、公告适配、资料包上下文）
+from .repository_resolver import (
+    RepoResolutionError,
+    RepositoryResolver,
+    canonical_repo_url,
+    canonical_key,
+    load_repo_map,
+)
+from .advisory_adapter import (
+    AdvisoryAdapter,
+    CWE_CATEGORY_MAP,
+    parse_version_range,
+    version_in_range,
+)
+from .package_context import T1PackageContext
+from .tools import TOOL_ERROR_CODES
 
 # 兼容别名：便于调用方使用历史命名
 ValidationReport = VerificationReport  # noqa: F811  (legacy name alias)
@@ -102,6 +127,7 @@ __all__ = [
     # §4.2 向后兼容导出
     "VulnGymTools",
     "ToolResult",
+    "load_repo_catalog",
     "normalize_project_from_repo",
     "BaseLLMClient",
     "ResilientLLMClient",
@@ -142,6 +168,7 @@ __all__ = [
     "FORBIDDEN_INTERNAL_FIELDS",
     "ORIGIN_CONSTANT",
     "REPORT_REQUIRED_TOP_FIELDS",
+    "REPORT_AUDIT_FIELDS",
     "SELF_CHECK_STATUS_VALUES",
     "STATUS_VALUES",
     "TOOL_NAMES",
@@ -161,4 +188,9 @@ __all__ = [
     "validate_report",
     "validate_self_check",
     "validate_tool_call",
+    # I1 分类本体
+    "CategoryTaxonomy",
+    "TaxonomyCategory",
+    "load_category_taxonomy",
+    "validate_taxonomy_data",
 ]

@@ -37,7 +37,9 @@ def mock_tools(tmp_path: Path) -> VulnGymTools:
     repo_cache.mkdir()
     
     # 创建一个测试项目
-    project = repo_cache / "test-project" / "abcd1234abcd1234abcd1234abcd1234abcd1234"
+    # Field checkers resolve the local key from the canonical URL basename
+    # (``https://github.com/test/project`` -> ``project``).
+    project = repo_cache / "project" / "abcd1234abcd1234abcd1234abcd1234abcd1234"
     project.mkdir(parents=True)
     (project / "src").mkdir()
     (project / "src" / "test.js").write_text("console.log('test');")
@@ -51,12 +53,14 @@ def mock_tools(tmp_path: Path) -> VulnGymTools:
         "details": "Test description"
     }))
     
-    # 创建 manifest
+    # 与 URL 推导出的本地 key 对齐，使 checkout/read_file_lines 真正到达
+    # 夹具；测试才能覆盖文件缺失、坏 commit 等目标场景。
     manifest = {
-        "test-project": {
+        "items": [{
             "repo_url": "https://github.com/test/project",
-            "commits": ["abcd1234abcd1234abcd1234abcd1234abcd1234"]
-        }
+            "project": "project",
+            "commit": "abcd1234abcd1234abcd1234abcd1234abcd1234",
+        }]
     }
     
     return VulnGymTools(

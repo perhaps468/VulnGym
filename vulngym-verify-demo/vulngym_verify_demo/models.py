@@ -145,6 +145,7 @@ class ToolCall:
     ok: bool
     input: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
     evidence_refs: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -154,6 +155,7 @@ class ToolCall:
             "input": self.input,
             "ok": self.ok,
             "error": self.error,
+            "error_code": self.error_code,
             "evidence_refs": list(self.evidence_refs),
         }
 
@@ -165,6 +167,7 @@ class ToolCall:
             ok=bool(d["ok"]),
             input=d.get("input"),
             error=d.get("error"),
+            error_code=d.get("error_code"),
             evidence_refs=list(d.get("evidence_refs", []) or []),
         )
 

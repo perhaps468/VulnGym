@@ -4,7 +4,7 @@
   "title": "VulnGym VerificationReport",
   "description": "每条输入记录输出一行 JSON。坏输入行也必须生成报告：使用 __invalid_input__:<line_no> 填充缺失的 report_id/entry_id，并追加可选 input_error（line_no、kind、message）。",
   "type": "object",
-  "required": ["report_id", "entry_id", "verdict", "fields", "summary", "self_check", "plan", "tool_trace"],
+  "required": ["report_id", "entry_id", "verdict", "fields", "summary"],
   "additionalProperties": true,
   "properties": {
     "report_id": {
@@ -63,7 +63,7 @@
     },
     "tool_trace": {
       "type": "array",
-      "description": "运行时审计字段，至少记录实际调用的 3 类工具；不能只记录计划中的工具名",
+      "description": "可选运行时审计字段；若输出，仅记录实际调用的工具。完整验证路径通常至少包含三类工具。",
       "items": {
         "$ref": "#/definitions/ToolCall"
       }
@@ -92,7 +92,7 @@
   "definitions": {
     "FieldResult": {
       "type": "object",
-      "required": ["status", "confidence", "evidence", "evidence_refs"],
+      "required": ["status", "confidence", "evidence"],
       "additionalProperties": true,
       "properties": {
         "status": {
@@ -197,7 +197,7 @@
         },
         "tool": {
           "type": "string",
-          "description": "工具名：read_advisory | checkout | read_file_lines | grep_code | git_log"
+          "description": "工具名：read_advisory | checkout | read_file_lines | grep_code | git_log | git_tags_at_commit"
         },
         "input": {
           "type": "object",

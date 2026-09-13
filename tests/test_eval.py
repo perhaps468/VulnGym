@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -19,7 +20,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "vulngym-verify-demo"))
 
-from vulngym_verify_demo.eval import evaluate, format_metrics  # noqa: E402
+from vulngym_verify_demo.eval import evaluate, format_metrics, load_gold  # noqa: E402
 
 
 def test_explicit_gold_format():
@@ -204,10 +205,11 @@ def test_invalid_input_entry():
     
     m = evaluate(reports, gold)
     
-    # __invalid_input__ 只比对 verdict，不计入字段统计
-    assert m["n_entries"] == 1
-    assert m["verdict_correct"] == 1
+    # 损坏输入 fixture 不混入冻结的字段准确率或找错召回率。
+    assert m["n_entries"] == 0
+    assert m["verdict_correct"] == 0
     assert m["field_total"] == 0  # 不计入字段
+    assert m["excluded_invalid_entries"] == 1
 
 
 def test_field_breakdown():
@@ -383,3 +385,142 @@ def test_error_recall_calculation():
     assert m["error_total"] == 2
     assert m["error_hit"] == 1
     assert m["error_recall"] == 0.5
+
+
+def test_error_recall_requires_incorrect_verdict_not_matching_field_only():
+    """冻结口径：错误 entry 只有 verdict=incorrect 才算找出。"""
+    reports = [{
+        "entry_id": "e9", "verdict": "uncertain",
+        "fields": {name: {"status": "incorrect"} for name in (
+            "entry_point", "critical_operation", "commit", "vuln_ids",
+            "vuln_title", "vuln_category_l1", "vuln_category_l2", "trace",
+        )},
+    }]
+    gold = {"e9": {
+        "verdict": "incorrect",
+        "fields": {
+            "entry_point": "incorrect", "critical_operation": "correct", "commit": "correct",
+            "vuln_ids": "correct", "vuln_title": "correct", "vuln_category_l1": "correct",
+            "vuln_category_l2": "correct", "trace": "correct",
+        },
+    }}
+    metrics = evaluate(reports, gold)
+    assert metrics["error_total"] == 1
+    assert metrics["error_hit"] == 0
+    assert metrics["error_recall"] == 0.0
+
+
+def test_error_recall_counts_incorrect_verdict_even_when_wrong_field_is_different():
+    """召回是 entry 级，字段归因仍由 field_accuracy 单独度量。"""
+    reports = [{
+        "entry_id": "e10", "verdict": "incorrect",
+        "fields": {name: {"status": "correct"} for name in (
+            "entry_point", "critical_operation", "commit", "vuln_ids",
+            "vuln_title", "vuln_category_l1", "vuln_category_l2", "trace",
+        )},
+    }]
+    reports[0]["fields"]["trace"] = {"status": "incorrect"}
+    gold = {"e10": {
+        "verdict": "incorrect",
+        "fields": {
+            "entry_point": "incorrect", "critical_operation": "correct", "commit": "correct",
+            "vuln_ids": "correct", "vuln_title": "correct", "vuln_category_l1": "correct",
+            "vuln_category_l2": "correct", "trace": "correct",
+        },
+    }}
+    metrics = evaluate(reports, gold)
+    assert metrics["error_recall"] == 1.0
+    assert metrics["field_accuracy"] < 1.0
+
+
+def test_missing_incorrect_report_counts_as_field_errors_and_recall_miss():
+    gold = {"e11": {
+        "verdict": "incorrect",
+        "fields": {
+            "entry_point": "incorrect", "critical_operation": "correct", "commit": "correct",
+            "vuln_ids": "correct", "vuln_title": "correct", "vuln_category_l1": "correct",
+            "vuln_category_l2": "correct", "trace": "correct",
+        },
+    }}
+    metrics = evaluate([], gold)
+    assert metrics["field_hit"] == 0
+    assert metrics["field_total"] == 8
+    assert metrics["error_recall"] == 0.0
+
+
+def test_invalid_status_and_missing_field_are_scored_as_field_errors():
+    """报告不是有效三态时不能被宽松地当作 uncertain 或 correct。"""
+    gold = {"e12": {
+        "verdict": "correct",
+        "fields": {
+            "entry_point": "correct", "critical_operation": "correct", "commit": "correct",
+            "vuln_ids": "correct", "vuln_title": "correct", "vuln_category_l1": "correct",
+            "vuln_category_l2": "correct", "trace": "correct",
+        },
+    }}
+    report = {
+        "entry_id": "e12", "verdict": "correct",
+        "fields": {name: {"status": "correct"} for name in gold["e12"]["fields"]},
+    }
+    report["fields"]["commit"] = {"status": "maybe"}
+    report["fields"].pop("trace")
+    metrics = evaluate([report], gold)
+    assert metrics["field_hit"] == 6
+    assert metrics["field_total"] == 8
+
+
+def test_duplicate_and_unexpected_reports_are_auditable_and_do_not_score():
+    gold = {"e13": {
+        "verdict": "correct",
+        "fields": {
+            "entry_point": "correct", "critical_operation": "correct", "commit": "correct",
+            "vuln_ids": "correct", "vuln_title": "correct", "vuln_category_l1": "correct",
+            "vuln_category_l2": "correct", "trace": "correct",
+        },
+    }}
+    valid = {
+        "entry_id": "e13", "verdict": "correct",
+        "fields": {name: {"status": "correct"} for name in gold["e13"]["fields"]},
+    }
+    metrics = evaluate([valid, valid, {"entry_id": "not-in-gold", "verdict": "correct"}], gold)
+    # Repeated entry IDs are removed from the prediction index, so e13 is a
+    # missing report rather than allowing last-write-wins behavior.
+    assert metrics["duplicate_report_count"] == 1
+    assert metrics["unexpected_report_count"] == 1
+    assert metrics["field_hit"] == 0
+    assert metrics["verdict_correct"] == 0
+
+
+def test_load_gold_rejects_incomplete_explicit_statuses_and_duplicates(tmp_path: Path):
+    incomplete = tmp_path / "incomplete.jsonl"
+    incomplete.write_text(json.dumps({"entry_id": "e", "verdict": "correct", "fields": {}}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_gold(incomplete)
+
+    duplicate = tmp_path / "duplicate.jsonl"
+    row = {"entry_id": "e", "verdict": "correct", "incorrect_fields": []}
+    duplicate.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_gold(duplicate)
+
+
+def test_load_gold_normalises_compatibility_format(tmp_path: Path):
+    path = tmp_path / "compat.jsonl"
+    path.write_text(
+        json.dumps({
+            "entry_id": "compat", "verdict": "incorrect",
+            "incorrect_fields": ["commit"],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    gold = load_gold(path)
+    assert gold["compat"]["format"] == "compat"
+    assert gold["compat"]["fields"]["commit"] == "incorrect"
+    assert gold["compat"]["fields"]["entry_point"] == "uncertain"
+
+
+def test_public_smoke_fixture_has_no_gold_file():
+    """公开输入可生成报告，但金标必须保留在非公开评测边界之外。"""
+    public_dir = ROOT / "vulngym-verify-demo" / "public_fixtures"
+    assert (public_dir / "entries.jsonl").is_file()
+    assert not (public_dir / "gold.jsonl").exists()

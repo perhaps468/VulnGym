@@ -6,7 +6,7 @@
   * repo_url -> project 唯一映射（防 collision）
   * 4 类失败（404、坏 JSON、坏 commit、路径穿越）返回 ToolResult(ok=false)
   * 无网络运行
-  * role 字段枚举限制
+  * manifest/catalog 不携带漏洞角色或版本范围结论
   * 并发只读安全
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -32,6 +33,7 @@ from vulngym_verify_demo.tools import (  # noqa: E402
     ToolResult,
     UnknownProjectError,
     VulnGymTools,
+    load_repo_catalog,
     normalize_project_from_repo,
     load_manifest,
 )
@@ -216,10 +218,10 @@ class TestReadAdvisory:
 
     def test_normal_read(self, tmp_workspace, tmp_path):
         repo_cache, advisory_dir = tmp_workspace
-        adv = advisory_dir / "GHSA-DEMO-0001-XSS.json"
-        adv.write_text('{"id": "GHSA-DEMO-0001-XSS", "severity": "high"}', encoding="utf-8")
+        adv = advisory_dir / "GHSA-DEMO-0001-0XSS.json"
+        adv.write_text('{"id": "GHSA-DEMO-0001-0XSS", "severity": "high"}', encoding="utf-8")
         t = VulnGymTools(repo_cache_dir=repo_cache, advisory_dir=advisory_dir, manifest=None)
-        r = t.read_advisory("GHSA-DEMO-0001-XSS")
+        r = t.read_advisory("GHSA-DEMO-0001-0XSS")
         assert r.ok
         assert r.data["severity"] == "high"
 
@@ -273,12 +275,33 @@ class TestReadFileLines:
         assert r.ok
         assert r.data["end"] <= r.data["total_lines"]
 
+    def test_start_beyond_file_end_is_structured_contradiction(self, tools, manifest):
+        """起始行越界是已确认的标注错误，不能返回可与任意文本匹配的空片段。"""
+        item = manifest["items"][0]
+        co = tools.checkout(item["project"], item["commit"])
+        assert co.ok
+
+        r = tools.read_file_lines(
+            co.data["cwd"], item["file"], 99999, 99999,
+        )
+
+        assert not r.ok
+        assert r.error_code == "line_out_of_range"
+        assert r.data == {
+            "file": item["file"],
+            "requested_start": 99999,
+            "requested_end": 99999,
+            "total_lines": r.data["total_lines"],
+        }
+        assert r.data["total_lines"] > 0
+
     def test_file_not_found(self, tools, manifest):
         item = manifest["items"][0]
         co = tools.checkout(item["project"], item["commit"])
         assert co.ok
         r = tools.read_file_lines(co.data["cwd"], "src/nonexistent.js", 1, 10)
         assert not r.ok
+        assert r.error_code == "file_missing_at_commit"
 
     def test_path_escape_via_file(self, tools, manifest):
         """file 含 .. 或绝对路径 → 拒绝"""
@@ -361,6 +384,98 @@ class TestGitLog:
 
 
 # ============================================================
+# TestLocalGitCloneBackend
+# ============================================================
+class TestLocalGitCloneBackend:
+    """本地 clone 是权威后端；工具只读对象数据库，不切换共享 HEAD。"""
+
+    @staticmethod
+    def _run(repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], check=True, capture_output=True,
+            text=True, encoding="utf-8",
+        ).stdout.strip()
+
+    def test_reads_exact_commit_without_checkout(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+        self._run(repo, "config", "user.email", "test@example.invalid")
+        self._run(repo, "config", "user.name", "VulnGym test")
+        source = repo / "src"
+        source.mkdir()
+        (source / "app.py").write_text("first = 1\nsecond = 2\n", encoding="utf-8")
+        self._run(repo, "add", ".")
+        self._run(repo, "commit", "-m", "fixture")
+        commit = self._run(repo, "rev-parse", "HEAD")
+        original_head = self._run(repo, "rev-parse", "HEAD")
+        catalog = {"items": [{
+            "repo_url": "https://github.com/example/local-fixture",
+            "project": "local-fixture",
+            "repo_path": str(repo),
+        }]}
+        tools = VulnGymTools(tmp_path / "snapshots", tmp_path / "advisories", repo_catalog=catalog)
+
+        checkout = tools.checkout("local-fixture", commit)
+        assert checkout.ok
+        assert checkout.data["backend"] == "git"
+        assert checkout.data["cwd"] == f"git://local-fixture/{commit}"
+        read = tools.read_file_lines(checkout.data["cwd"], "src/app.py", 2, 2)
+        assert read.ok and read.data["snippet"] == "second = 2\n"
+        grep = tools.grep_code(checkout.data["cwd"], "src/app.py", r"second")
+        assert grep.ok and grep.data["hits"][0]["line"] == 2
+        history = tools.git_log("local-fixture", commit, limit=1)
+        assert history.ok and history.data[0]["sha"] == commit
+        assert self._run(repo, "rev-parse", "HEAD") == original_head
+
+    def test_catalog_rejects_verdict_fields(self, tmp_path: Path):
+        path = tmp_path / "catalog.json"
+        path.write_text(json.dumps({"items": [{
+            "repo_url": "https://github.com/example/repo", "project": "repo",
+            "repo_path": str(tmp_path), "role": "vulnerable",
+        }]}), encoding="utf-8")
+        with pytest.raises(ValueError, match="verdict"):
+            load_repo_catalog(path)
+
+    def test_configured_clone_unavailable_has_stable_error_code(self, tmp_path: Path):
+        missing_repo = tmp_path / "missing-local-clone"
+        catalog = {"items": [{
+            "repo_url": "https://github.com/example/missing",
+            "project": "missing",
+            "repo_path": str(missing_repo),
+        }]}
+        tools = VulnGymTools(
+            tmp_path / "snapshots", tmp_path / "advisories", repo_catalog=catalog,
+        )
+
+        result = tools.checkout("missing", "a" * 40)
+
+        assert not result.ok
+        assert result.error_code == "repo_unavailable"
+
+    def test_missing_commit_in_available_clone_has_stable_error_code(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+        self._run(repo, "config", "user.email", "test@example.invalid")
+        self._run(repo, "config", "user.name", "VulnGym test")
+        (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+        self._run(repo, "add", ".")
+        self._run(repo, "commit", "-m", "fixture")
+        catalog = {"items": [{
+            "repo_url": "https://github.com/example/local-fixture",
+            "project": "local-fixture",
+            "repo_path": str(repo),
+        }]}
+        tools = VulnGymTools(
+            tmp_path / "snapshots", tmp_path / "advisories", repo_catalog=catalog,
+        )
+
+        result = tools.checkout("local-fixture", "f" * 40)
+
+        assert not result.ok
+        assert result.error_code == "commit_missing"
+
+
+# ============================================================
 # TestManifestSchema
 # ============================================================
 
@@ -373,14 +488,13 @@ class TestManifestSchema:
         assert len(manifest["items"]) >= 4
 
     def test_required_fields(self, manifest):
-        required = {"repo_url", "project", "commit", "version", "role"}
+        required = {"repo_url", "project", "commit", "file", "targets"}
         for it in manifest["items"]:
             assert required.issubset(it.keys()), f"missing fields in {it}"
 
-    def test_role_enum(self, manifest):
-        allowed = {"vulnerable", "fixed", "unknown"}
+    def test_manifest_has_no_verdict_or_version_range_fields(self, manifest):
         for it in manifest["items"]:
-            assert it["role"] in allowed, f"bad role: {it}"
+            assert not ({"role", "vulnerable", "fixed", "affected_versions", "fixed_in"} & set(it))
 
     def test_commit_is_40_hex(self, manifest):
         for it in manifest["items"]:

@@ -3,11 +3,12 @@
 
 - 真实后端：QwenClient（DashScope）、DeepSeekClient、GLMClient（智谱）
 - 离线后端：MockLLMClient，按 prompt 关键词返回受控 JSON
-- 容错包装：ResilientLLMClient — 真实 LLM 报错自动降级到 Mock，并在 stderr 提示
+- 容错包装：ResilientLLMClient — 真实 LLM 报错自动降级到 SafeLLMClient
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -18,7 +19,6 @@ from .prompts import (
     PROMPT_VERSIONS,
     SELF_CHECK_PROMPT,
     TRACE_OVERALL_PROMPT,
-    VULN_IDS_PROMPT,
     VULN_TITLE_PROMPT,
     get_prompt_version,
     vuln_category_prompt,
@@ -31,12 +31,26 @@ class LLMMessage:
     content: str
 
 
+@dataclass
+class ProvenancedResult:
+    """单次 LLM 调用的结果及其 provenance。
+
+    used_fallback=True 表示该次调用实际走了 Safe fallback。该标记是单次调用
+    作用域，前一次调用的 fallback 状态不会污染后一次调用。
+    """
+    content: str
+    used_fallback: bool = False
+
+
 # ============================================================
 # I4 新增：脱敏 + 结构化响应解析
 # ============================================================
 
 # 脱敏正则（参考 schema._sanitize_message，提到模块顶层）
 _REDACT_RX = [
+    # Query strings and diagnostics frequently expose credentials without a
+    # provider-specific ``sk-`` prefix.
+    (re.compile(r"(?i)\b(?:api[_-]?key|authorization|token|secret)\s*[:=]\s*['\"]?[^\s,&'\"]+"), "<redacted>"),
     (re.compile(r"[A-Za-z]:\\[^\s\"']+"), "<abspath>"),   # Windows 反斜杠
     (re.compile(r"[A-Za-z]:/[^\s\"']+"), "<abspath>"),    # Windows 正斜杠
     (re.compile(r"/(?:home|Users|var|tmp|opt|root)/[^\s\"']+"), "<abspath>"),  # POSIX
@@ -61,6 +75,32 @@ def redact_text(text: str) -> str:
 
 # 合法的 status 取值
 _VALID_STATUS = {"correct", "incorrect", "uncertain"}
+_JSON_FENCE_RX = re.compile(
+    r"^\s*```(?:json)?\s*\r?\n(?P<body>.*?)\r?\n?```\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_json_object(raw: Any) -> Dict[str, Any]:
+    """Decode a provider JSON object, including an otherwise-valid code fence.
+
+    GLM's OpenAI-compatible endpoint can return `````json`` fenced content
+    despite an instruction to return JSON only.  Accept only a whole-response
+    fence (rather than extracting arbitrary JSON from prose) so unrelated
+    explanatory text never becomes a judgement by accident.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        raise ValueError("LLM response is not a JSON string or object")
+    text = raw.strip()
+    match = _JSON_FENCE_RX.match(text)
+    if match:
+        text = match.group("body").strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("LLM response JSON is not an object")
+    return data
 
 
 def parse_structured_response(raw: Any) -> Dict[str, Any]:
@@ -81,15 +121,9 @@ def parse_structured_response(raw: Any) -> Dict[str, Any]:
         "evidence": "LLM output unparseable; cannot perform semantic judgement.",
         "evidence_refs": [],
     }
-    if isinstance(raw, dict):
-        data = raw
-    else:
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return UNCERTAIN_FALLBACK
-
-    if not isinstance(data, dict):
+    try:
+        data = parse_json_object(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
         return UNCERTAIN_FALLBACK
 
     # status
@@ -149,6 +183,16 @@ class BaseLLMClient:
     def chat(self, messages: List[LLMMessage], *, temperature: float = 0.0) -> str:  # pragma: no cover
         raise NotImplementedError
 
+    def chat_with_provenance(
+        self, messages: List[LLMMessage], *, temperature: float = 0.0,
+    ) -> ProvenancedResult:
+        """调用 chat 并返回带 provenance 的结果。
+
+        默认实现视为 primary 成功（used_fallback=False）。SafeLLMClient 与
+        ResilientLLMClient 覆写此方法以提供真实 fallback 标记。
+        """
+        return ProvenancedResult(content=self.chat(messages, temperature=temperature))
+
     @property
     def name(self) -> str:  # pragma: no cover
         return type(self).__name__
@@ -174,11 +218,6 @@ class QwenClient(BaseLLMClient):
             raise LLMError("QWEN_BASE_URL not set")
 
     def chat(self, messages: List[LLMMessage], *, temperature: float = 0.0) -> str:
-        try:
-            import requests  # type: ignore
-        except ImportError as e:
-            raise LLMError("requests not installed; pip install requests") from e
-
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -194,12 +233,15 @@ class QwenClient(BaseLLMClient):
         except requests.RequestException as e:
             raise LLMError(f"qwen network error: {e}") from e
         if resp.status_code >= 400:
-            raise LLMError(f"qwen http {resp.status_code}: {resp.text[:500]}")
-        body = resp.json()
+            raise LLMError(f"qwen http {resp.status_code}")
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise LLMError("qwen returned invalid JSON") from e
         try:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as e:
-            raise LLMError(f"unexpected qwen response: {body}") from e
+            raise LLMError("unexpected qwen response structure") from e
 
     @property
     def name(self) -> str:
@@ -250,12 +292,15 @@ class DeepSeekClient(BaseLLMClient):
         except requests.RequestException as e:
             raise LLMError(f"deepseek network error: {e}") from e
         if resp.status_code >= 400:
-            raise LLMError(f"deepseek http {resp.status_code}: {resp.text[:500]}")
-        body = resp.json()
+            raise LLMError(f"deepseek http {resp.status_code}")
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise LLMError("deepseek returned invalid JSON") from e
         try:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as e:
-            raise LLMError(f"unexpected deepseek response: {body}") from e
+            raise LLMError("unexpected deepseek response structure") from e
 
     @property
     def name(self) -> str:
@@ -286,11 +331,6 @@ class GLMClient(BaseLLMClient):
             raise LLMError("GLM_BASE_URL not set")
 
     def chat(self, messages: List[LLMMessage], *, temperature: float = 0.0) -> str:
-        try:
-            import requests  # type: ignore
-        except ImportError as e:
-            raise LLMError("requests not installed; pip install requests") from e
-
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -301,17 +341,44 @@ class GLMClient(BaseLLMClient):
             "temperature": temperature,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
         }
+
+        # ``requests`` is convenient when installed, but the offline demo must
+        # not require a package installation merely to use the configured GLM
+        # endpoint.  The standard-library fallback keeps the same payload and
+        # intentionally omits server response bodies from errors.
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-        except requests.RequestException as e:
-            raise LLMError(f"glm network error: {e}") from e
-        if resp.status_code >= 400:
-            raise LLMError(f"glm http {resp.status_code}: {resp.text[:500]}")
-        body = resp.json()
+            import requests  # type: ignore
+        except ImportError:
+            try:
+                from urllib import error as urlerror
+                from urllib import request as urlrequest
+                request = urlrequest.Request(
+                    url,
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                with urlrequest.urlopen(request, timeout=self.timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+            except urlerror.HTTPError as exc:
+                raise LLMError(f"glm http {exc.code}") from exc
+            except (urlerror.URLError, OSError, ValueError, UnicodeError) as exc:
+                raise LLMError(f"glm network or response error: {type(exc).__name__}") from exc
+        else:
+            try:
+                resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            except requests.RequestException as exc:
+                raise LLMError(f"glm network error: {type(exc).__name__}") from exc
+            if resp.status_code >= 400:
+                raise LLMError(f"glm http {resp.status_code}")
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise LLMError("glm returned invalid JSON") from exc
         try:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as e:
-            raise LLMError(f"unexpected glm response: {body}") from e
+            raise LLMError("unexpected glm response structure") from e
 
     @property
     def name(self) -> str:
@@ -425,15 +492,28 @@ class SafeLLMClient(BaseLLMClient):
             )
         return json.dumps(self._SAFE_RESPONSE, ensure_ascii=False)
 
+    def chat_with_provenance(
+        self, messages: List[LLMMessage], *, temperature: float = 0.0,
+    ) -> ProvenancedResult:
+        # SafeLLMClient 本身就是 fallback，任何调用都标记为 used_fallback=True。
+        return ProvenancedResult(
+            content=self.chat(messages, temperature=temperature),
+            used_fallback=True,
+        )
+
     @property
     def name(self) -> str:
         return "SafeLLMClient"
 
 
 class ResilientLLMClient(BaseLLMClient):
-    """容错包装：首选 primary，失败 fallback 到 fallback，并在 stderr 打一行警告。
+    """Per-request safe fallback for transient provider failures.
 
-    用于"网络/额度异常时不崩溃"，对应 VulnGym 评分维度"鲁棒性"。
+    A failed request is never retried: it immediately receives one safe
+    ``uncertain`` fallback.  Crucially, that failure must not poison later,
+    independent fields in the same JSONL batch.  Each later request is allowed
+    one normal primary attempt, preserving the sequential/no-retry Standard
+    protocol while containing transient timeouts to their own field.
     """
 
     def __init__(self, primary: BaseLLMClient, fallback: BaseLLMClient) -> None:
@@ -442,18 +522,24 @@ class ResilientLLMClient(BaseLLMClient):
         self._degraded = False
 
     def chat(self, messages: List[LLMMessage], *, temperature: float = 0.0) -> str:
-        if not self._degraded:
-            try:
-                return self.primary.chat(messages, temperature=temperature)
-            except LLMError as e:
-                self._degraded = True
-                print(
-                    f"[warn] LLM {self.primary.name} failed: {str(e)[:120]}\n"
-                    f"[warn] falling back to {self.fallback.name}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        return self.fallback.chat(messages, temperature=temperature)
+        return self.chat_with_provenance(messages, temperature=temperature).content
+
+    def chat_with_provenance(
+        self, messages: List[LLMMessage], *, temperature: float = 0.0,
+    ) -> ProvenancedResult:
+        try:
+            content = self.primary.chat(messages, temperature=temperature)
+            return ProvenancedResult(content=content, used_fallback=False)
+        except Exception as e:
+            self._degraded = True
+            print(
+                f"[warn] LLM {redact_text(str(self.primary.name))} failed: {redact_text(str(e))[:120]}\n"
+                f"[warn] using {self.fallback.name} for this request only",
+                file=sys.stderr,
+                flush=True,
+            )
+            content = self.fallback.chat(messages, temperature=temperature)
+            return ProvenancedResult(content=content, used_fallback=True)
 
     @property
     def name(self) -> str:
@@ -464,7 +550,7 @@ class ResilientLLMClient(BaseLLMClient):
         return self._degraded
 
 
-def make_client(prefer: str = "auto") -> BaseLLMClient:
+def make_client(prefer: str = "auto", *, timeout: float = 30.0) -> BaseLLMClient:
     """根据环境变量与 prefer 选择 LLM 实现。
 
     重要约束：
@@ -473,14 +559,21 @@ def make_client(prefer: str = "auto") -> BaseLLMClient:
       `SafeLLMClient`，避免"编造证据"扣分。
     - `auto` 模式优先级：DeepSeek → GLM → Qwen → SafeLLMClient。
     """
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not math.isfinite(float(timeout))
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a positive number")
     prefer = (prefer or "auto").lower()
     if prefer == "mock":
         return ScriptedMockLLMClient()
 
     builders = {
-        "qwen": _try_qwen,
-        "glm": _try_glm,
-        "deepseek": _try_deepseek,
+        "qwen": lambda: _try_qwen(timeout),
+        "glm": lambda: _try_glm(timeout),
+        "deepseek": lambda: _try_deepseek(timeout),
     }
     if prefer in builders:
         primary = builders[prefer]()
@@ -489,38 +582,42 @@ def make_client(prefer: str = "auto") -> BaseLLMClient:
         return ResilientLLMClient(primary=primary, fallback=SafeLLMClient())
 
     # auto：按 DeepSeek → GLM → Qwen 顺序尝试真实后端，最后兜底 SafeLLMClient。
-    for builder in (_try_deepseek, _try_glm, _try_qwen):
+    for builder in (
+        lambda: _try_deepseek(timeout),
+        lambda: _try_glm(timeout),
+        lambda: _try_qwen(timeout),
+    ):
         primary = builder()
         if primary is not None:
             return ResilientLLMClient(primary=primary, fallback=SafeLLMClient())
     return SafeLLMClient()
 
 
-def _try_qwen() -> Optional[BaseLLMClient]:
+def _try_qwen(timeout: float = 30.0) -> Optional[BaseLLMClient]:
     if not (os.environ.get("QWEN_API_KEY") and os.environ.get("QWEN_BASE_URL")):
         return None
     try:
-        return QwenClient()
+        return QwenClient(timeout=timeout)
     except LLMError as e:
-        print(f"[warn] Qwen init failed: {e}", file=sys.stderr)
+        print(f"[warn] Qwen init failed: {redact_text(str(e))}", file=sys.stderr)
         return None
 
 
-def _try_glm() -> Optional[BaseLLMClient]:
+def _try_glm(timeout: float = 30.0) -> Optional[BaseLLMClient]:
     if not (os.environ.get("GLM_API_KEY") and os.environ.get("GLM_BASE_URL")):
         return None
     try:
-        return GLMClient()
+        return GLMClient(timeout=timeout)
     except LLMError as e:
-        print(f"[warn] GLM init failed: {e}", file=sys.stderr)
+        print(f"[warn] GLM init failed: {redact_text(str(e))}", file=sys.stderr)
         return None
 
 
-def _try_deepseek() -> Optional[BaseLLMClient]:
+def _try_deepseek(timeout: float = 30.0) -> Optional[BaseLLMClient]:
     if not (os.environ.get("DEEPSEEK_API_KEY") and os.environ.get("DEEPSEEK_BASE_URL")):
         return None
     try:
-        return DeepSeekClient()
+        return DeepSeekClient(timeout=timeout)
     except LLMError as e:
-        print(f"[warn] DeepSeek init failed: {e}", file=sys.stderr)
+        print(f"[warn] DeepSeek init failed: {redact_text(str(e))}", file=sys.stderr)
         return None

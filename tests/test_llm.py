@@ -75,6 +75,15 @@ class TestParseStructured:
         assert out["evidence_refs"] == []
         assert out["evidence"]  # 非空
 
+    def test_markdown_fenced_json_is_accepted(self):
+        """GLM commonly wraps otherwise-valid JSON in a ```json fence."""
+        out = parse_structured_response(
+            '```json\n{"status":"correct","confidence":0.95,"evidence":"same finding"}\n```'
+        )
+        assert out["status"] == "correct"
+        assert out["confidence"] == 0.95
+        assert out["evidence"] == "same finding"
+
     def test_empty_evidence_default_text(self):
         raw = json.dumps({"status": "correct", "confidence": 0.85, "evidence": ""})
         out = parse_structured_response(raw)
@@ -131,6 +140,11 @@ class TestRedactText:
         out = redact_text(s)
         assert "sk-abcdefghijklmnopqrstuvwxyz012345" not in out
 
+    def test_generic_credential_parameter(self):
+        s = "request failed: api_key=short-test-key"
+        out = redact_text(s)
+        assert "short-test-key" not in out
+
     def test_long_hex_redacted(self):
         s = "trace: " + "a" * 40
         out = redact_text(s)
@@ -167,14 +181,14 @@ class TestMockClient:
     def test_category_path_returns_correct(self):
         llm = ScriptedMockLLMClient()
         out = llm.chat([LLMMessage("user",
-            "[PROMPT_VERSION=vuln_category_l1_judge@1]\n判断 vuln_category_l1 是否正确。\nadvisory_hint_l1: XSS\nactual: XSS")])
+            "[PROMPT_VERSION=vuln_category_l1_judge@2]\n判断 vuln_category_l1 是否正确。\nadvisory_hint_l1: XSS\nactual: XSS")])
         data = json.loads(out)
         assert data["status"] == "correct"
 
     def test_category_mismatch_returns_incorrect(self):
         llm = ScriptedMockLLMClient()
         out = llm.chat([LLMMessage("user",
-            "[PROMPT_VERSION=vuln_category_l1_judge@1]\n判断 vuln_category_l1 是否正确。\nadvisory_hint_l1: RCE\nactual: XSS")])
+            "[PROMPT_VERSION=vuln_category_l1_judge@2]\n判断 vuln_category_l1 是否正确。\nadvisory_hint_l1: RCE\nactual: XSS")])
         data = json.loads(out)
         assert data["status"] == "incorrect"
 
@@ -197,9 +211,9 @@ class TestMockClient:
         llm = ScriptedMockLLMClient()
         for prompt in [
             "[PROMPT_VERSION=vuln_title_judge@1]\ntitle",
-            "[PROMPT_VERSION=vuln_category_l1_judge@1]\nXSS\nactual: XSS",
+            "[PROMPT_VERSION=vuln_category_l1_judge@2]\nXSS\nactual: XSS",
             "[PROMPT_VERSION=vuln_ids_judge@1]\nadvisory cve_id: X\nghsa_id: Y\nactual: [X,Y]",
-            "[PROMPT_VERSION=trace_overall_judge@1]\nentry\nnode_count: 3",
+            "[PROMPT_VERSION=trace_overall_judge@2]\nentry\nnode_count: 3",
             "[PROMPT_VERSION=unknown@1]\nfallback",
         ]:
             out = llm.chat([LLMMessage("user", prompt)])
@@ -273,7 +287,18 @@ class TestResilientClient:
         assert data["status"] == "uncertain"
         assert r.degraded
 
-    def test_after_degraded_no_retry_primary(self):
+    def test_unexpected_primary_error_falls_back_and_redacts_log(self, capsys):
+        """非 LLMError（如 HTTP/JSON 库错误）同样安全降级，日志不泄露 key。"""
+        class LeakyClient(BaseLLMClient):
+            name = "LeakyClient"
+            def chat(self, messages, *, temperature=0.0):
+                raise ValueError("Bearer super-secret-token-12345678 response invalid")
+
+        out = ResilientLLMClient(LeakyClient(), SafeLLMClient()).chat([LLMMessage("user", "x")])
+        assert json.loads(out)["status"] == "uncertain"
+        assert "super-secret-token" not in capsys.readouterr().err
+
+    def test_each_independent_request_attempts_primary_once(self):
         call_count = {"primary": 0, "fallback": 0}
 
         class CountingFailingPrimary(BaseLLMClient):
@@ -292,20 +317,33 @@ class TestResilientClient:
         r = ResilientLLMClient(CountingFailingPrimary(), CountingFallback())
         for _ in range(3):
             r.chat([LLMMessage("user", "x")])
-        assert call_count["primary"] == 1  # 只调一次
+        # 每个独立字段请求只尝试 primary 一次；没有内部重试，也不会因
+        # 前一个短暂故障把整批条目永久切到 Safe fallback。
+        assert call_count["primary"] == 3
         assert call_count["fallback"] == 3
         assert r.degraded
 
-    def test_recover_after_degraded_never(self):
-        """degraded=True 后即使 primary 重启也不会重试。"""
-        primary = ScriptedMockLLMClient()
-        fallback = SafeLLMClient()
-        r = ResilientLLMClient(primary, fallback)
-        # 故意触发 fallback（手工置 degraded）
-        r._degraded = True
-        out = r.chat([LLMMessage("user", "anything")])
-        data = json.loads(out)
-        assert data["status"] == "uncertain"
+    def test_later_request_can_recover_after_transient_failure(self):
+        class FailOncePrimary(BaseLLMClient):
+            name = "FailOncePrimary"
+
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, messages, *, temperature=0.0):
+                self.calls += 1
+                if self.calls == 1:
+                    raise LLMError("temporary timeout")
+                return json.dumps({
+                    "status": "correct", "confidence": 0.8,
+                    "evidence": "primary recovered", "evidence_refs": [],
+                })
+
+        primary = FailOncePrimary()
+        r = ResilientLLMClient(primary, SafeLLMClient())
+        assert json.loads(r.chat([LLMMessage("user", "first")]))["status"] == "uncertain"
+        assert json.loads(r.chat([LLMMessage("user", "second")]))["status"] == "correct"
+        assert primary.calls == 2
 
 
 # ============================================================
@@ -356,6 +394,12 @@ class TestMakeClient:
         monkeypatch.delenv("QWEN_BASE_URL", raising=False)
         c = make_client(prefer="qwen")
         assert isinstance(c, BaseLLMClient)
+
+    def test_rejects_non_positive_timeout(self):
+        with pytest.raises(ValueError):
+            make_client(prefer="mock", timeout=0)
+        with pytest.raises(ValueError):
+            make_client(prefer="mock", timeout=float("inf"))
 
 
 # ============================================================
@@ -414,11 +458,11 @@ class TestPromptVersioning:
 
     def test_category_prompt_has_version_prefix(self):
         s = p_mod.vuln_category_prompt("l1", "XSS", "XSS")
-        assert "[PROMPT_VERSION=vuln_category_l1_judge@1]" in s
+        assert "[PROMPT_VERSION=vuln_category_l1_judge@2]" in s
 
     def test_trace_prompt_has_version_prefix(self):
-        s = p_mod.TRACE_OVERALL_PROMPT.format(entry_id="e1", node_count=3)
-        assert "[PROMPT_VERSION=trace_overall_judge@1]" in s
+        s = p_mod.TRACE_OVERALL_PROMPT.format(entry_id="e1", node_count=3, trace_summary="node")
+        assert "[PROMPT_VERSION=trace_overall_judge@2]" in s
 
     def test_mock_client_recognizes_version_prefix(self):
         llm = ScriptedMockLLMClient()

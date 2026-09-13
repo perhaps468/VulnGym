@@ -15,7 +15,42 @@ VulnGym 验证系统对漏洞数据集进行字段级自动化审核，支持：
 - ✅ **三态输出**：correct / incorrect / uncertain，附带置信度和可追溯证据
 - ✅ **Agent 闭环**：规划（Plan）→ 工具调用（Execute）→ 反思（Self-Check）
 - ✅ **鲁棒容错**：坏输入、文件缺失、公告 404、LLM 失败均不崩溃
-- ✅ **评测达标**：字段准确率 0.950（≥ 0.85）、错误召回率 1.000（≥ 0.90）
+- ✅ **契约可验收**：T1Data 离线资料包契约（408 条输入 → 408 条 schema 合法报告，零 schema-invalid）
+- ⚠️ **质量指标未在当地证明**：官方 0.85 字段准确率 / 0.90 找错召回率需要**独立 gold**，
+  资料包不提供。README 后续出现的 0.950 / 1.000 均为 **mock fixture 的非评测性数字**，
+  不能作为 T1Data 或隐藏集成绩。
+
+---
+
+## 官方 T1 CLI（T1Data 资料包契约）
+
+T1Data 资料包声明的调用契约为 `python -B -m vulngym_agent`，由仓库根的 `vulngym_agent`
+包提供（核心逻辑仍在 `vulngym_verify_demo`）。
+
+从**仓库根目录**执行：
+
+```bash
+python -B -m vulngym_agent <entries.jsonl|packaged-candidates.jsonl> \
+  --package-root <T1Data> \
+  --repo-map <T1Data/repo-map.json> \
+  --validation-output <validation.jsonl> \
+  --evidence-output  <evidence.jsonl> \
+  --manifest-output  <manifest.jsonl>
+```
+
+要点：
+
+- 仓库身份的唯一键是**规范化 `repo_url`**（`RepositoryResolver`），不使用 basename；
+  `jlowin/fastmcp` 与 `PrefectHQ/fastmcp` 因此不会串仓。
+- 只使用只读 Git 子命令（`cat-file` / `show` / `log` / `tag` …），不执行受检仓库代码；
+  默认启用运行期离线守卫，任何网络访问都会被阻断并记录。
+- `--mode evaluation`（默认）**拒绝** `--llm mock`；控制流测试请显式使用
+  `--mode test-mock --llm mock`，此时 manifest 带有 `non_evaluative_run=true`
+  且拒绝计算正式指标。
+- 提供 `--gold` 时只接受**独立** gold；位于资料包内部的任何文件（含输入的 `verify`
+  字段）都会被拒绝。
+- `--commit-gate` 会对全部 `(repo_url, commit)` 执行只读 `git cat-file -e` 校验。
+
 
 ---
 
@@ -65,8 +100,8 @@ Processing 11 entries...
 ...
 
 === Evaluation Metrics ===
-field_accuracy: 0.950 (≥ 0.85 ✓)
-error_recall: 1.000 (≥ 0.90 ✓)
+field_accuracy: 0.950   # 仅 mock fixture 的非评测性数字，不是 T1Data/隐藏集成绩
+error_recall: 1.000     # 同上
 verdict_accuracy: 1.000
 ```
 
@@ -348,13 +383,17 @@ pytest tests/ --cov=vulngym_verify_demo --cov-report=html
 
 ---
 
-## 评测结果（Public Fixtures）
+## 评测结果（Public Fixtures，非评测性）
+
+> ⚠️ **这不是质量结论。** 下表来自 10~11 条 `public_fixtures/mock_data` 样本 + `--llm mock`
+> 的剧本答案，只能验证流水线可跑通。它**不能**代表 T1Data、官方隐藏集或任何真实模型能力。
+> `mock` 运行在正式 CLI 中被显式拒绝（`--mode evaluation`）或标记 `non_evaluative_run=true`。
 
 | 指标 | 数值 | 阈值 | 状态 |
 |------|------|------|------|
-| 字段准确率 | 0.950 | ≥ 0.85 | ✅ |
-| 错误召回率 | 1.000 | ≥ 0.90 | ✅ |
-| Verdict 准确率 | 1.000 | - | ✅ |
+| 字段准确率（fixture+mock） | 0.950 | ≥ 0.85 | ⚠️ 非评测性 |
+| 错误召回率（fixture+mock） | 1.000 | ≥ 0.90 | ⚠️ 非评测性 |
+| Verdict 准确率（fixture+mock） | 1.000 | - | ⚠️ 非评测性 |
 
 **字段分解**：
 

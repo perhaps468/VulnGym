@@ -1,73 +1,34 @@
-# VulnGym Public Test Fixtures
+# VulnGym public smoke fixtures
 
-这是 VulnGym 评测器的公开测试集，用于 CI 门禁和基准测试。
+此目录只包含可公开的输入，不含任何 gold 标签。CI 用它确认离线 CLI
+能够读取 JSONL、隔离异常行并生成可提交的报告；它不会计算分数，也不能
+作为训练或阈值评测的依据。
 
-## 文件说明
+## 当前内容和边界
 
-- **entries.jsonl**: 11 条测试样本（10 条正常 + 1 条异常输入）
-- **gold.jsonl**: 对应的显式三态金标
+- `entries.jsonl`：11 条公开冒烟输入（10 条正常输入、1 条故意损坏输入）。
+- 输出由 CLI 在每次运行中生成，例如 `/tmp/reports_ci.jsonl`；提交时只能提交
+  本次运行产生的报告，不能附带 gold。
+- 本子集只有 11 条，**不是**课题 Standard 所要求的 20 条公开测试集。其余
+  9 条真实公开样本尚未提供，补齐前不得把它称作完整公开测试集或发布其指标。
 
-## 测试覆盖
+历史上与这批输入同目录的 `gold.jsonl` 已移除，避免公开测试金标泄露。
+仓库中的 `mock_data/` 是单独标记的开发回归 fixture，不能替代 50 条训练集
+或隐藏评测集。
 
-### 正常样本（10 条）
+## 离线生成公开输出
 
-1. **entry-00001**: 全部字段正确（XSS）
-2. **entry-00002**: entry_point 错误（命令注入）
-3. **entry-00003**: entry_point 错误 - 文件不存在（命令注入）
-4. **entry-00004**: critical_operation + vuln_category_l2 错误（权限绕过）
-5. **entry-00005**: 全部字段正确（SQL 注入）
-6. **entry-00006**: commit + vuln_category_l2 不确定（代码注入）
-7. **entry-00007**: 全部字段正确（路径遍历）
-8. **entry-00008**: vuln_category_l2 不确定（开放重定向）
-9. **entry-00009**: 全部字段正确（缓冲区溢出）
-10. **entry-00010**: trace 不确定（信息泄露）
-
-### 异常样本（1 条）
-
-- **__invalid_input__bad_json**: 异常输入，期望返回 verdict=uncertain
-
-## 金标格式
-
-显式三态格式，每个字段明确标记为：
-- `correct`: 字段正确
-- `incorrect`: 字段错误
-- `uncertain`: 字段不确定（需要人工复核）
-
-示例：
-```json
-{
-  "entry_id": "entry-00001",
-  "verdict": "correct",
-  "fields": {
-    "entry_point": "correct",
-    "critical_operation": "correct",
-    "commit": "correct",
-    "vuln_ids": "correct",
-    "vuln_title": "correct",
-    "vuln_category_l1": "correct",
-    "vuln_category_l2": "correct",
-    "trace": "correct"
-  }
-}
-```
-
-## 使用方法
+在 `vulngym-verify-demo` 目录执行：
 
 ```bash
-cd vulngym-verify-demo
 python -m vulngym_verify_demo \
   --entries public_fixtures/entries.jsonl \
   --repo-cache mock_repo \
   --advisories mock_advisories \
+  --manifest mock_repo/manifest.json \
   --out /tmp/reports.jsonl \
-  --llm mock \
-  --bench
+  --llm mock
 ```
 
-## 评测指标
-
-- **field_accuracy**: 字段级准确率，目标 ≥ 0.85
-- **error_recall**: 错误召回率，目标 ≥ 0.90
-- **verdict_accuracy**: 整体判定准确率
-
-运行 `pytest tests/test_eval.py -v` 查看评测测试。
+该命令刻意不传入 `--gold` 或 `--bench`。若要开发评测器，使用有明确许可的
+开发回归 gold，并将评测结果与公开输出分开保存。

@@ -5,7 +5,7 @@
 
 契约（来自 I5_START_HANDBOOK §3 与 I1 report_schema.json）：
   * plan 必含 version="1" / tools_planned / fields_planned
-  * tool_trace ≥3 类工具调用（advisory + repository + git 各 ≥1）
+  * 正常完整路径的 tool_trace 覆盖 advisory + repository + git；降级路径只记录真实调用
   * tool_trace 失败也记录（ok=false + error），不抛未处理异常
   * tool_trace.input 脱敏（commit ≤12 字符、不含绝对路径）
   * self_check 必含 status/agree/comment/checked_fields 四键
@@ -29,6 +29,8 @@ sys.path.insert(0, str(ROOT / "vulngym-verify-demo"))
 from vulngym_verify_demo import agent as agent_mod  # noqa: E402
 from vulngym_verify_demo.agent import (  # noqa: E402
     EIGHT_FIELDS,
+    _RecordingTools,
+    _revisit_semantic_fields,
     get_eight_fields,
     get_tool_category,
     plan_for_entry,
@@ -105,7 +107,7 @@ def _valid_entry() -> Dict[str, Any]:
     """构造一条最小合法 entry。"""
     return {
         "entry_id": "entry-00001",
-        "report_id": "GHSA-DEMO-0001-XSS",
+        "report_id": "GHSA-DEMO-0001-0XSS",
         "repo_url": "https://github.com/example/blog-platform",
         "commit": "1111111111111111111111111111111111111111",
         "verify": {
@@ -114,8 +116,8 @@ def _valid_entry() -> Dict[str, Any]:
         },
         "origin": "GitHub Advisory Database (reviewed)",
         "project": "blog-platform",
-        "source_link": "https://github.com/advisories/GHSA-DEMO-0001-XSS",
-        "vuln_ids": ["CVE-2026-DEMO-0001", "GHSA-DEMO-0001-XSS"],
+        "source_link": "https://github.com/advisories/GHSA-DEMO-0001-0XSS",
+        "vuln_ids": ["CVE-2026-0001", "GHSA-DEMO-0001-0XSS"],
         "vuln_title": "Blog Platform Stored DOM XSS via Comment Rich Text",
         "vuln_category_l1": "XSS",
         "vuln_category_l2": "Stored XSS",
@@ -211,6 +213,24 @@ class TestToolTrace:
         assert all(isinstance(s, int) for s in seqs)
         assert all(s >= 1 for s in seqs)
 
+    def test_trace_records_only_actual_checker_calls(self, tools):
+        """trace 是检查器真实调用的顺序记录，不能在结束后补做审计调用。"""
+        calls: List[str] = []
+        for name in (
+            "read_advisory", "checkout", "read_file_lines", "grep_code",
+            "git_log", "git_tags_at_commit",
+        ):
+            original = getattr(tools, name)
+
+            def wrapper(*args, _name=name, _original=original, **kwargs):
+                calls.append(_name)
+                return _original(*args, **kwargs)
+
+            setattr(tools, name, wrapper)
+
+        rep = verify_entry(_valid_entry(), tools, ScriptedMockLLMClient())
+        assert [call["tool"] for call in rep["tool_trace"]] == calls
+
     def test_ok_false_recorded_on_failure(self, tools):
         """advisory 找不到时仍记录（ok=false + error）。"""
         entry = _valid_entry()
@@ -219,6 +239,7 @@ class TestToolTrace:
         adv = next(t for t in rep["tool_trace"] if t["tool"] == "read_advisory")
         assert adv["ok"] is False
         assert isinstance(adv["error"], str) and adv["error"]
+        assert adv["error_code"] == "advisory_not_found"
 
     def test_input_redacted_for_commit(self, tools):
         """commit 在 trace.input 中只出现前 12 字符（防 32+ hex 触发 redact）。"""
@@ -248,11 +269,12 @@ class TestToolTrace:
         rep = verify_entry(entry, tools, ScriptedMockLLMClient())
         assert isinstance(rep, dict)
         assert "tool_trace" in rep
-        # 仍然 3 类工具都被记录
+        # clone 无法解析时不会伪造 repository 调用；字段 evidence 会说明降级原因。
         cats = {get_tool_category(t["tool"]) for t in rep["tool_trace"]}
         assert "advisory" in cats
-        assert "repository" in cats
         assert "git" in cats
+        assert "repository" not in cats
+        assert "本地" in rep["fields"]["entry_point"]["evidence"]
 
     def test_evidence_refs_are_json_paths(self, tools):
         """trace.evidence_refs 必须是 JSON 路径格式 (fields.<name>.evidence)。"""
@@ -294,6 +316,27 @@ class TestSelfCheck:
         assert isinstance(out["comment"], str) and out["comment"]
         assert isinstance(out["checked_fields"], list)
 
+    def test_self_check_uses_versioned_prompt(self):
+        captured: List[str] = []
+
+        class CaptureLLM(BaseLLMClient):
+            def chat(self, messages, *, temperature=0.0):
+                captured.append(messages[0].content)
+                return json.dumps({"agree": True, "comment": "ok"})
+
+        self_check(_valid_entry(), {}, CaptureLLM())
+        assert "[PROMPT_VERSION=self_check_judge@1]" in captured[0]
+
+    def test_self_check_accepts_markdown_fenced_json(self):
+        """Provider formatting must not turn a completed self-check into skipped."""
+        class FencedJSONLLM(BaseLLMClient):
+            def chat(self, messages, *, temperature=0.0):
+                return '```json\n{"agree": true, "comment": "evidence is consistent"}\n```'
+
+        out = self_check(_valid_entry(), {}, FencedJSONLLM())
+        assert out["status"] == "completed"
+        assert out["agree"] is True
+
     def test_skipped_path_agree_is_false(self):
         """LLM 抛异常 → status=skipped + agree=False（I5 契约）。"""
         class BoomLLM(BaseLLMClient):
@@ -309,15 +352,15 @@ class TestSelfCheck:
         assert isinstance(out["comment"], str) and out["comment"]
 
     def test_skipped_path_safe_client(self):
-        """SafeLLMClient 的 self-check 分支返回 False → status=completed（来自 LLM），agree=False。"""
-        # SafeLLMClient 的 self-check 分支返回 agree=False + comment
+        """SafeLLMClient 是 fallback → self_check 必须返回 skipped + agree=False。"""
         fr = {"entry_point": {"status": "correct", "confidence": 0.9, "evidence": "x",
                               "evidence_refs": []}}
         out = self_check(_valid_entry(), fr, SafeLLMClient())
-        # SafeLLMClient 返回有效 dict → completed 路径
-        assert out["status"] == "completed"
+        # SafeLLMClient 的 chat_with_provenance 标记 used_fallback=True → skipped
+        assert out["status"] == "skipped"
         assert out["agree"] is False
         assert out["comment"]
+        assert "fallback" in out["comment"].lower() or "unavailable" in out["comment"].lower()
 
     def test_checked_fields_lists_all_fields(self):
         llm = ScriptedMockLLMClient()
@@ -374,6 +417,69 @@ class TestSelfCheck:
         out = self_check(_valid_entry(), fr, llm)
         errs = validate_self_check(out)
         assert errs == [], f"validate_self_check errors: {errs}"
+
+    def test_resilient_fallback_marks_skipped(self):
+        """ResilientLLMClient primary 失败走 Safe fallback → self_check skipped。"""
+        from vulngym_verify_demo.llm_client import ResilientLLMClient
+
+        class BoomPrimary(BaseLLMClient):
+            name = "BoomPrimary"
+            def chat(self, messages, *, temperature=0.0):
+                raise RuntimeError("primary down")
+
+        llm = ResilientLLMClient(primary=BoomPrimary(), fallback=SafeLLMClient())
+        fr = {"entry_point": {"status": "correct", "confidence": 0.9, "evidence": "x",
+                              "evidence_refs": []}}
+        out = self_check(_valid_entry(), fr, llm)
+        assert out["status"] == "skipped"
+        assert out["agree"] is False
+
+    def test_revisit_only_touches_semantic_fields(self):
+        """复核只修改 title/L1/L2/trace，确定性字段不变。"""
+        class ReviseLLM(BaseLLMClient):
+            name = "ReviseLLM"
+            def chat(self, messages, *, temperature=0.0):
+                return json.dumps({
+                    "vuln_title": {"status": "incorrect", "confidence": 0.7, "evidence": "revised"},
+                    "vuln_category_l1": {"status": "correct", "confidence": 0.8, "evidence": "kept"},
+                    "vuln_category_l2": {"status": "uncertain", "confidence": 0.5, "evidence": "revised"},
+                    "trace": {"status": "correct", "confidence": 0.6, "evidence": "kept"},
+                })
+
+        fields = {
+            "entry_point": {"status": "correct", "confidence": 0.9, "evidence": "ep", "evidence_refs": []},
+            "critical_operation": {"status": "correct", "confidence": 0.9, "evidence": "co", "evidence_refs": []},
+            "commit": {"status": "uncertain", "confidence": 0.4, "evidence": "commit", "evidence_refs": []},
+            "vuln_ids": {"status": "correct", "confidence": 0.95, "evidence": "ids", "evidence_refs": []},
+            "vuln_title": {"status": "correct", "confidence": 0.8, "evidence": "title orig", "evidence_refs": []},
+            "vuln_category_l1": {"status": "correct", "confidence": 0.8, "evidence": "l1 orig", "evidence_refs": []},
+            "vuln_category_l2": {"status": "correct", "confidence": 0.8, "evidence": "l2 orig", "evidence_refs": []},
+            "trace": {"status": "incorrect", "confidence": 0.7, "evidence": "trace orig", "evidence_refs": []},
+        }
+        updated, record = _revisit_semantic_fields(_valid_entry(), fields, ReviseLLM())
+        # 确定性字段不变
+        assert updated["entry_point"]["status"] == "correct"
+        assert updated["critical_operation"]["status"] == "correct"
+        assert updated["commit"]["status"] == "uncertain"
+        assert updated["vuln_ids"]["status"] == "correct"
+        # 语义字段被复核修改
+        assert updated["vuln_title"]["status"] == "incorrect"
+        assert updated["vuln_category_l2"]["status"] == "uncertain"
+        assert record["status"] == "completed"
+        assert len(record["changes"]) >= 1
+
+    def test_revisit_failure_preserves_original(self):
+        """复核 LLM 失败 / fallback 时保留原初判。"""
+        fields = {
+            "vuln_title": {"status": "correct", "confidence": 0.8, "evidence": "t", "evidence_refs": []},
+            "vuln_category_l1": {"status": "correct", "confidence": 0.8, "evidence": "l1", "evidence_refs": []},
+            "vuln_category_l2": {"status": "correct", "confidence": 0.8, "evidence": "l2", "evidence_refs": []},
+            "trace": {"status": "correct", "confidence": 0.8, "evidence": "tr", "evidence_refs": []},
+        }
+        updated, record = _revisit_semantic_fields(_valid_entry(), fields, SafeLLMClient())
+        assert updated["vuln_title"]["status"] == "correct"
+        assert record["status"] == "skipped"
+        assert record["changes"] == []
 
 
 # ============================================================
@@ -452,7 +558,7 @@ class TestVerifyEntries:
         e1 = _valid_entry()
         e2 = _valid_entry()
         e2["entry_id"] = "entry-00002"
-        e2["report_id"] = "GHSA-DEMO-0002-RCE"
+        e2["report_id"] = "GHSA-DEMO-0002-0RCE"
         e2["repo_url"] = "https://github.com/example/shell-runner"
         e2["commit"] = "2222222222222222222222222222222222222222"
         e2["verify"]["commit"] = "2222222222222222222222222222222222222222"
@@ -462,7 +568,7 @@ class TestVerifyEntries:
         e2["critical_operation"]["file"] = "src/runner.js"
         e2["critical_operation"]["code"] = "child_process.exec(userInput);"
         e2["trace"] = []
-        e2["vuln_ids"] = ["CVE-2026-DEMO-0002"]
+        e2["vuln_ids"] = ["CVE-2026-0002"]
         e2["vuln_title"] = "Shell Runner RCE"
         e2["vuln_category_l1"] = "代码注入"
         e2["vuln_category_l2"] = "命令注入"
@@ -578,6 +684,7 @@ class TestHelpers:
         assert get_tool_category("checkout") == "git"
         assert get_tool_category("read_file_lines") == "repository"
         assert get_tool_category("git_log") == "git"
+        assert get_tool_category("git_tags_at_commit") == "git"
         assert get_tool_category("grep_code") == "repository"
 
     def test_get_tool_category_unknown(self):
@@ -602,3 +709,134 @@ class TestImportSurface:
             get_tool_category,
             EIGHT_FIELDS,
         )
+
+
+# ============================================================
+# TestPerEntryCache — per-entry 只读 cache（P1-A）
+# ============================================================
+
+
+class TestPerEntryCache:
+    """per-entry 只读 cache 契约：重复读取只调一次底层工具，cache hit 不伪造 trace。"""
+
+    def test_cache_key_accepts_kwargs_for_git_log(self):
+        """_cache_key 必须接受 **kwargs——git_log 传 limit= 不能 TypeError。
+
+        回归测试：真实运行时 _cache_key 缺少 **kwargs，git_log(limit=5) 直接
+        TypeError 导致整条 entry 降级为 agent-level fallback。
+        """
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        # git_log 传 limit 作为 kwarg（与 agent.git_log() 实际调用方式一致）
+        key = tools._cache_key("git_log", "myproject", "abc1234", limit=10)
+        assert key is not None
+        assert "10" in key
+        assert key == "git_log:myproject:abc1234:10"
+
+    def test_cache_key_default_limit_when_omitted(self):
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        key = tools._cache_key("git_log", "proj", "commit")
+        assert key == "git_log:proj:commit:5"
+
+    def test_cache_key_different_limit_different_key(self):
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        k1 = tools._cache_key("git_log", "p", "c", limit=5)
+        k2 = tools._cache_key("git_log", "p", "c", limit=20)
+        assert k1 != k2
+
+    def test_cache_key_checkout(self):
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        key = tools._cache_key("checkout", "proj", "abc1234")
+        assert key == "checkout:proj:abc1234"
+
+    def test_cache_key_read_file_lines(self):
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        key = tools._cache_key("read_file_lines", "/cwd", "src/a.js", 1, 10)
+        assert key == "read_file_lines:/cwd:src/a.js:1:10"
+
+    def test_cache_key_git_tags_at_commit(self):
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        key = tools._cache_key("git_tags_at_commit", "proj", "abc1234")
+        assert key == "git_tags_at_commit:proj:abc1234"
+
+    def test_cache_key_returns_none_for_uncached_tools(self):
+        """read_advisory / grep_code 不缓存。"""
+        tools = _RecordingTools.__new__(_RecordingTools)
+        tools._cache = {}
+        assert tools._cache_key("read_advisory", "GHSA-X") is None
+        assert tools._cache_key("grep_code", "/cwd", "f", "pat") is None
+
+    def test_cache_hit_does_not_record_tool_trace(self):
+        """cache hit 直接返回缓存结果，不追加 tool_trace。"""
+        class FakeTools:
+            def __init__(self):
+                self.call_count = 0
+            def read_file_lines(self, cwd, file, start, end):
+                self.call_count += 1
+                from vulngym_verify_demo.tools import ToolResult
+                return ToolResult("read_file_lines", True, {"lines": ["x"]}, None, None)
+
+        fake = FakeTools()
+        rec = _RecordingTools(fake)
+        # 第一次调用：底层工具被调用，trace 记录一条
+        r1 = rec.read_file_lines("/cwd", "a.js", 1, 5)
+        assert fake.call_count == 1
+        assert len(rec.trace) == 1
+        # 第二次相同调用：cache hit，底层工具不被调用，trace 不增加
+        r2 = rec.read_file_lines("/cwd", "a.js", 1, 5)
+        assert fake.call_count == 1  # 没有再次调用
+        assert len(rec.trace) == 1  # 没有追加 trace
+        assert r2.ok is True
+
+    def test_cache_only_stores_successful_results(self):
+        """失败结果不缓存，允许后续重试。"""
+        from vulngym_verify_demo.tools import ToolResult
+
+        call_count = {"n": 0}
+
+        class FlakyTools:
+            def checkout(self, project, commit):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    return ToolResult("checkout", False, None, "not found", "checkout_failed")
+                return ToolResult("checkout", True, {"dir": "/tmp/x"}, None, None)
+
+        rec = _RecordingTools(FlakyTools())
+        # 第一次失败：不缓存
+        r1 = rec.checkout("proj", "abc1234")
+        assert r1.ok is False
+        assert len(rec.trace) == 1
+        # 第二次相同调用：因为失败没缓存，底层工具再次被调用
+        r2 = rec.checkout("proj", "abc1234")
+        assert call_count["n"] == 2
+        assert r2.ok is True
+        assert len(rec.trace) == 2
+        # 第三次：成功结果已缓存，不再调用底层工具
+        r3 = rec.checkout("proj", "abc1234")
+        assert call_count["n"] == 2
+        assert len(rec.trace) == 2
+
+    def test_cache_is_per_instance_not_global(self):
+        """cache 绑定在 _RecordingTools 实例上，不同实例不共享。"""
+        from vulngym_verify_demo.tools import ToolResult
+
+        class CountingTools:
+            def __init__(self):
+                self.n = 0
+            def checkout(self, project, commit):
+                self.n += 1
+                return ToolResult("checkout", True, {}, None, None)
+
+        t = CountingTools()
+        rec1 = _RecordingTools(t)
+        rec2 = _RecordingTools(t)
+        rec1.checkout("p", "c")
+        assert t.n == 1
+        # rec2 有自己独立的 cache，不会命中 rec1 的缓存
+        rec2.checkout("p", "c")
+        assert t.n == 2
